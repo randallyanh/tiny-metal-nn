@@ -7,6 +7,19 @@
 
 namespace tmnn::metal {
 
+AllocStats &alloc_stats() {
+  static AllocStats stats;
+  return stats;
+}
+void reset_alloc_stats() {
+  auto &s = alloc_stats();
+  s.create_buffer_calls.store(0);
+  s.create_buffer_bytes.store(0);
+  s.blit_copy_calls.store(0);
+  s.blit_copy_bytes.store(0);
+  s.buffer_contents_calls.store(0);
+}
+
 DeviceInfo probe_default_device() { return {}; }
 void release_device(DeviceInfo &) {}
 

@@ -9,11 +9,29 @@
  * and call these free functions with void* handles.
  */
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <string>
 
 namespace tmnn::metal {
+
+/// Process-wide counters for newBufferWithLength / blit copy / contents()
+/// access. Counters are incremented unconditionally (atomics; hot-path cost
+/// negligible). Reset and read by the benchmark binary's --allocation-trace
+/// option to baseline hot-path memory traffic.
+struct AllocStats {
+  std::atomic<uint64_t> create_buffer_calls{0};
+  std::atomic<uint64_t> create_buffer_bytes{0};
+  std::atomic<uint64_t> blit_copy_calls{0};
+  std::atomic<uint64_t> blit_copy_bytes{0};
+  std::atomic<uint64_t> buffer_contents_calls{0};
+};
+
+/// Process-global stats handle.
+AllocStats &alloc_stats();
+/// Reset all counters to zero.
+void reset_alloc_stats();
 
 /// Information returned from device probing.
 struct DeviceInfo {

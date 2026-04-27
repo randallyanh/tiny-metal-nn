@@ -17,6 +17,20 @@
 
 namespace tmnn::metal {
 
+AllocStats &alloc_stats() {
+  static AllocStats stats;
+  return stats;
+}
+
+void reset_alloc_stats() {
+  auto &s = alloc_stats();
+  s.create_buffer_calls.store(0, std::memory_order_relaxed);
+  s.create_buffer_bytes.store(0, std::memory_order_relaxed);
+  s.blit_copy_calls.store(0, std::memory_order_relaxed);
+  s.blit_copy_bytes.store(0, std::memory_order_relaxed);
+  s.buffer_contents_calls.store(0, std::memory_order_relaxed);
+}
+
 // ---------------------------------------------------------------------------
 // Device probing
 // ---------------------------------------------------------------------------
@@ -89,6 +103,9 @@ void *create_buffer(void *device, size_t bytes, bool shared) {
                                    : MTLResourceStorageModePrivate;
   id<MTLBuffer> buf = [TO_DEVICE(device) newBufferWithLength:bytes
                                                      options:opts];
+  auto &s = alloc_stats();
+  s.create_buffer_calls.fetch_add(1, std::memory_order_relaxed);
+  s.create_buffer_bytes.fetch_add(bytes, std::memory_order_relaxed);
   return TO_VOID(buf); // +1 retained from newBuffer
 }
 
@@ -100,6 +117,7 @@ void release_buffer(void *buffer) {
 void *buffer_contents(void *buffer) {
   if (!buffer)
     return nullptr;
+  alloc_stats().buffer_contents_calls.fetch_add(1, std::memory_order_relaxed);
   return [TO_BUFFER(buffer) contents];
 }
 
@@ -278,6 +296,10 @@ void encode_blit_copy(void *cmd_buf, void *src_buffer, size_t src_offset,
                       void *dst_buffer, size_t dst_offset, size_t length) {
   if (!cmd_buf || !src_buffer || !dst_buffer || length == 0)
     return;
+
+  auto &s = alloc_stats();
+  s.blit_copy_calls.fetch_add(1, std::memory_order_relaxed);
+  s.blit_copy_bytes.fetch_add(length, std::memory_order_relaxed);
 
   id<MTLCommandBuffer> cb = TO_CMDBUF(cmd_buf);
   id<MTLBlitCommandEncoder> enc = [cb blitCommandEncoder];

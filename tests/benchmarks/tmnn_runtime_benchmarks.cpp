@@ -10,6 +10,7 @@
 #include "tiny-metal-nn/trainer.h"
 
 #include "tiny_metal_nn/runtime/autotune_search.h"
+#include "tiny_metal_nn/runtime/metal_device.h"
 #include "tiny_metal_nn/runtime/morton_sort.h"
 
 #include <algorithm>
@@ -709,6 +710,7 @@ int main(int argc, char **argv) {
   bool smoke = false;
   bool only_neulat_latency = false;
   bool run_neulat_latency = false;
+  bool allocation_trace = false;
   for (int i = 1; i < argc; ++i) {
     if (std::string_view(argv[i]) == "--smoke")
       smoke = true;
@@ -717,16 +719,34 @@ int main(int argc, char **argv) {
     else if (std::string_view(argv[i]) == "--only-neulat-latency") {
       run_neulat_latency = true;
       only_neulat_latency = true;
-    }
+    } else if (std::string_view(argv[i]) == "--allocation-trace")
+      allocation_trace = true;
   }
 
   if (!only_neulat_latency) {
     run_planner_benchmark(smoke ? 32 : 1024);
     run_morton_benchmark(smoke ? 8 : 128, smoke ? 256u : 1024u);
     run_autotune_benchmark(smoke);
+    // Reset counters here so the hot-step benchmark's own warmup is excluded
+    // from the trace; the inner benchmark function takes care of warmup.
+    if (allocation_trace) {
+      tmnn::metal::reset_alloc_stats();
+    }
     run_default_trainer_hot_step_benchmark(smoke);
   }
   if (run_neulat_latency)
     run_neulat_latency_benchmark(smoke);
+
+  if (allocation_trace) {
+    const auto &s = tmnn::metal::alloc_stats();
+    std::printf("alloc-trace: create_buffer_calls=%llu bytes=%llu "
+                "blit_copy_calls=%llu bytes=%llu "
+                "buffer_contents_calls=%llu\n",
+                (unsigned long long)s.create_buffer_calls.load(),
+                (unsigned long long)s.create_buffer_bytes.load(),
+                (unsigned long long)s.blit_copy_calls.load(),
+                (unsigned long long)s.blit_copy_bytes.load(),
+                (unsigned long long)s.buffer_contents_calls.load());
+  }
   return 0;
 }
