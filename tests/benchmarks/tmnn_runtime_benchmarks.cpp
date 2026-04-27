@@ -502,7 +502,8 @@ void run_autotune_benchmark(bool smoke) {
               static_cast<unsigned long long>(hot.autotune_measured_step_ns));
 }
 
-void run_default_trainer_hot_step_benchmark(bool smoke) {
+void run_default_trainer_hot_step_benchmark(bool smoke,
+                                             bool allocation_trace) {
   auto ctx = MetalContext::create();
   if (!ctx->is_gpu_available()) {
     std::printf("tmnn default-trainer hot-step: skipped (no GPU)\n");
@@ -541,6 +542,18 @@ void run_default_trainer_hot_step_benchmark(bool smoke) {
       std::exit(1);
     }
 
+    // Snapshot the trace counters at the boundary between warmup (which
+    // legitimately allocates) and the measured loop (which under 010 §2 #3
+    // should converge to zero allocs per step).
+    uint64_t alloc_before = 0, blit_before = 0, contents_before = 0;
+    if (allocation_trace) {
+      const auto &s = tmnn::metal::alloc_stats();
+      alloc_before = s.create_buffer_calls.load(std::memory_order_relaxed);
+      blit_before = s.blit_copy_calls.load(std::memory_order_relaxed);
+      contents_before =
+          s.buffer_contents_calls.load(std::memory_order_relaxed);
+    }
+
     std::vector<uint64_t> samples;
     samples.reserve(static_cast<size_t>(timed_steps));
     for (int i = 0; i < timed_steps; ++i) {
@@ -559,6 +572,24 @@ void run_default_trainer_hot_step_benchmark(bool smoke) {
     std::printf(
         "tmnn default-trainer hot-step [%s, batch=%d]: median=%.3f ms runs=%d\n",
         label, N, median_ns(std::move(samples)) / 1.0e6, timed_steps);
+
+    if (allocation_trace) {
+      const auto &s = tmnn::metal::alloc_stats();
+      const uint64_t alloc_d =
+          s.create_buffer_calls.load(std::memory_order_relaxed) - alloc_before;
+      const uint64_t blit_d =
+          s.blit_copy_calls.load(std::memory_order_relaxed) - blit_before;
+      const uint64_t contents_d =
+          s.buffer_contents_calls.load(std::memory_order_relaxed) -
+          contents_before;
+      std::printf(
+          "alloc-per-step [%s]: create_buffer=%.2f blit_copy=%.2f "
+          "buffer_contents=%.2f (%d measured steps)\n",
+          label,
+          static_cast<double>(alloc_d) / timed_steps,
+          static_cast<double>(blit_d) / timed_steps,
+          static_cast<double>(contents_d) / timed_steps, timed_steps);
+    }
   };
 
   auto sparse_cfg = default_trainer_config();
@@ -732,7 +763,7 @@ int main(int argc, char **argv) {
     if (allocation_trace) {
       tmnn::metal::reset_alloc_stats();
     }
-    run_default_trainer_hot_step_benchmark(smoke);
+    run_default_trainer_hot_step_benchmark(smoke, allocation_trace);
   }
   if (run_neulat_latency)
     run_neulat_latency_benchmark(smoke);
