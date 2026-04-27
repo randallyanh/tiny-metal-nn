@@ -48,6 +48,9 @@ public:
   [[nodiscard]] explicit operator bool() const noexcept { return obj_ != nil; }
 
   // Hands +1 retain back to caller; *this is left null.
+  // NB: name follows std::unique_ptr::release ("give up ownership"), not
+  // Objective-C [obj release] ("decrement refcount"). The [[nodiscard]]
+  // ensures callers do not silently leak the returned reference.
   [[nodiscard]] T release() noexcept {
     T tmp = obj_;
     obj_ = nil;

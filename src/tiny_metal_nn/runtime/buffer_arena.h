@@ -19,6 +19,10 @@
 
 namespace tmnn {
 
+namespace detail {
+class OwnedBufferHandle;
+}
+
 class BufferArena {
 public:
   /// Create an arena with the given initial slot capacity.
@@ -35,6 +39,11 @@ public:
 
   /// Allocate a buffer slot and return its handle.
   [[nodiscard]] BufferHandle allocate(const BufferDesc &desc);
+
+  /// RAII variant: returns a move-only handle whose dtor releases the slot.
+  /// New code should prefer this; the raw `allocate()` is retained for the
+  /// migration period and will be removed in Phase 3 of 010.
+  [[nodiscard]] detail::OwnedBufferHandle allocate_owned(const BufferDesc &desc);
 
   /// Release a buffer slot. Increments generation — existing handles
   /// become stale and will fail is_valid().

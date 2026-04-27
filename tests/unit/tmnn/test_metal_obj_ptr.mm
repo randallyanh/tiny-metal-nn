@@ -115,6 +115,23 @@ TEST_F(MetalObjPtrTest, SelfMoveAssignIsSafe) {
   EXPECT_TRUE(p);
 }
 
+TEST_F(MetalObjPtrTest, MoveFromNullProducesNullDest) {
+  Ptr a;
+  Ptr b = std::move(a);
+  EXPECT_FALSE(a);
+  EXPECT_FALSE(b);
+  EXPECT_EQ(g_dealloc_count, 0);
+}
+
+TEST_F(MetalObjPtrTest, BoolConversionReflectsHeldness) {
+  Ptr empty;
+  EXPECT_FALSE(static_cast<bool>(empty));
+  auto held = Ptr::adopt([[TmnnTestObj alloc] init]);
+  EXPECT_TRUE(static_cast<bool>(held));
+  (void)held.release();
+  EXPECT_FALSE(static_cast<bool>(held));
+}
+
 // Compile-time guarantees: copy is deleted, move-only.
 static_assert(!std::is_copy_constructible_v<Ptr>, "must be move-only");
 static_assert(!std::is_copy_assignable_v<Ptr>,    "must be move-only");

@@ -10,6 +10,7 @@
 
 #include "tiny_metal_nn/runtime/buffer_arena.h"
 #include "tiny_metal_nn/runtime/metal_device.h"
+#include "tiny_metal_nn/runtime/owned_buffer_handle.h"
 
 #include <cassert>
 #include <cstring>
@@ -110,6 +111,10 @@ BufferHandle BufferArena::allocate(const BufferDesc &desc) {
   ++live_count_;
 
   return {slot, meta.generation};
+}
+
+detail::OwnedBufferHandle BufferArena::allocate_owned(const BufferDesc &desc) {
+  return detail::OwnedBufferHandle(this, allocate(desc));
 }
 
 void BufferArena::release(BufferHandle handle) {
