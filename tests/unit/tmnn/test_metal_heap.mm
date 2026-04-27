@@ -35,6 +35,8 @@ protected:
     HeapConfig cfg;
     cfg.persistent_shared_capacity_bytes  = cap;
     cfg.persistent_private_capacity_bytes = cap;
+    cfg.transient_lane_bytes              = cap;
+    cfg.transient_lane_count              = 4;
     return Heap::create((MetalDevice)device_, cfg);
   }
 
@@ -46,6 +48,13 @@ protected:
     d.storage = Storage::Shared;
     d.hazard_tracking = HazardTracking::Untracked;
     d.debug_name = name;
+    return d;
+  }
+
+  AllocDesc transient_desc(std::size_t bytes,
+                           const char *name = "test.transient") {
+    AllocDesc d = desc(bytes, name);
+    d.lifetime = Lifetime::Transient;
     return d;
   }
 
@@ -171,7 +180,96 @@ TEST_F(MetalHeapTest, AllocateMicrobench) {
   const auto t1 = std::chrono::steady_clock::now();
   const auto ns =
       std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
-  std::printf("[metal_heap] allocate microbench: %.0f ns/call (%d iter)\n",
+  std::printf("[metal_heap] allocate microbench (Persistent): "
+              "%.0f ns/call (%d iter)\n",
+              static_cast<double>(ns) / kIter, kIter);
+}
+
+// === Transient lifetime ===
+
+TEST_F(MetalHeapTest, TransientAllocateBumpsLaneOffset) {
+  auto heap = make_heap();
+  heap->begin_transient_frame();
+  auto a = heap->allocate(transient_desc(1024)).value();
+  auto b = heap->allocate(transient_desc(1024)).value();
+  EXPECT_NE(a.cpu_data(), nullptr);
+  EXPECT_NE(b.cpu_data(), nullptr);
+  EXPECT_EQ(a.mtl_buffer(), b.mtl_buffer());          // same lane buffer
+  EXPECT_LT(a.offset(), b.offset());                  // bump forward
+  EXPECT_EQ(b.offset(), 1024u);                       // 256-aligned: 1024 -> 1024
+}
+
+TEST_F(MetalHeapTest, TransientFrameRotationResetsOffset) {
+  auto heap = make_heap();
+  heap->begin_transient_frame();
+  const auto lane0 = heap->stats().transient_current_lane;
+  (void)heap->allocate(transient_desc(2048)).value();
+  EXPECT_GT(heap->stats().transient_current_lane_used_bytes, 0u);
+  heap->end_transient_frame();
+
+  heap->begin_transient_frame();
+  EXPECT_NE(heap->stats().transient_current_lane, lane0);
+  EXPECT_EQ(heap->stats().transient_current_lane_used_bytes, 0u);
+}
+
+TEST_F(MetalHeapTest, TransientCapacityExceededReturnsError) {
+  HeapConfig cfg;
+  cfg.persistent_shared_capacity_bytes  = 1024 * 1024;
+  cfg.persistent_private_capacity_bytes = 0;
+  cfg.transient_lane_bytes              = 4096;
+  cfg.transient_lane_count              = 2;
+  auto heap = Heap::create((MetalDevice)device_, cfg);
+  ASSERT_NE(heap, nullptr);
+  heap->begin_transient_frame();
+  auto r = heap->allocate(transient_desc(8192));
+  ASSERT_FALSE(r.has_value());
+  EXPECT_EQ(r.error(), AllocError::TransientCapacityExceeded);
+}
+
+TEST_F(MetalHeapTest, TransientPrivateStorageRejected) {
+  auto heap = make_heap();
+  heap->begin_transient_frame();
+  AllocDesc d = transient_desc(1024);
+  d.storage = Storage::Private;
+  auto r = heap->allocate(d);
+  ASSERT_FALSE(r.has_value());
+  EXPECT_EQ(r.error(), AllocError::UnsupportedStorage);
+}
+
+TEST_F(MetalHeapTest, TransientDtorIsNoOpForLaneStorage) {
+  auto heap = make_heap();
+  heap->begin_transient_frame();
+  std::size_t lane_used_before = 0;
+  {
+    auto buf = heap->allocate(transient_desc(1024)).value();
+    lane_used_before = heap->stats().transient_current_lane_used_bytes;
+    EXPECT_EQ(lane_used_before, 1024u);
+  }
+  // Lane offset is NOT decremented by buffer destruction; it resets only
+  // on the next begin_transient_frame() landing on this lane.
+  EXPECT_EQ(heap->stats().transient_current_lane_used_bytes, lane_used_before);
+}
+
+// G5b: transient hot-path microbench — sub-100ns target.
+TEST_F(MetalHeapTest, TransientAllocateMicrobench) {
+  HeapConfig cfg;
+  cfg.persistent_shared_capacity_bytes  = 1024 * 1024;
+  cfg.persistent_private_capacity_bytes = 0;
+  cfg.transient_lane_bytes              = 64 * 1024 * 1024;  // 64 MiB lane
+  cfg.transient_lane_count              = 1;
+  auto heap = Heap::create((MetalDevice)device_, cfg);
+  heap->begin_transient_frame();
+  constexpr int kIter = 10000;
+  const auto t0 = std::chrono::steady_clock::now();
+  for (int i = 0; i < kIter; ++i) {
+    auto _ = heap->allocate(transient_desc(256, "test.t.micro")).value();
+    (void)_;
+  }
+  const auto t1 = std::chrono::steady_clock::now();
+  const auto ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+  std::printf("[metal_heap] allocate microbench (Transient): "
+              "%.0f ns/call (%d iter)\n",
               static_cast<double>(ns) / kIter, kIter);
 }
 
