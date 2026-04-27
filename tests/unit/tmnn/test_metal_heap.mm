@@ -250,6 +250,31 @@ TEST_F(MetalHeapTest, TransientDtorIsNoOpForLaneStorage) {
   EXPECT_EQ(heap->stats().transient_current_lane_used_bytes, lane_used_before);
 }
 
+// G6: begin_transient_frame() rotation cost — sub-1µs target. Measured
+// without a registered fence event (the with-fence path is dominated by GPU
+// signal latency, not heap bookkeeping, and is exercised separately).
+TEST_F(MetalHeapTest, BeginTransientFrameMicrobench) {
+  HeapConfig cfg;
+  cfg.persistent_shared_capacity_bytes  = 1024 * 1024;
+  cfg.persistent_private_capacity_bytes = 0;
+  cfg.transient_lane_bytes              = 1024 * 1024;
+  cfg.transient_lane_count              = 4;
+  auto heap = Heap::create((MetalDevice)device_, cfg);
+  ASSERT_NE(heap, nullptr);
+  constexpr int kIter = 10000;
+  const auto t0 = std::chrono::steady_clock::now();
+  for (int i = 0; i < kIter; ++i) {
+    heap->begin_transient_frame();
+    heap->end_transient_frame();
+  }
+  const auto t1 = std::chrono::steady_clock::now();
+  const auto ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+  std::printf("[metal_heap] begin/end transient frame: "
+              "%.0f ns/pair (%d iter)\n",
+              static_cast<double>(ns) / kIter, kIter);
+}
+
 // G5b: transient hot-path microbench — sub-100ns target.
 TEST_F(MetalHeapTest, TransientAllocateMicrobench) {
   HeapConfig cfg;
