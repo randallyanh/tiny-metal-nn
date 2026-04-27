@@ -98,9 +98,12 @@ Numerics tests use bit-exact comparisons for the deterministic paths and toleran
 Before opening:
 
 1. Local build is green: `cmake --build build && ctest --test-dir build -V`.
-2. No leftover `printf` / `std::cout` debug output.
-3. New code has tests; modified code's tests still pass.
-4. If your change moves a perf number, the new measurement (device, command, before/after) appears in the PR description.
+2. For changes that touch buffer ownership, lifetimes, or Metal resource
+   handling, also confirm the sanitizer build is clean:
+   `cmake -S . -B build-asan -DTMNN_ENABLE_SANITIZERS=ON && cmake --build build-asan && ctest --test-dir build-asan`.
+3. No leftover `printf` / `std::cout` debug output.
+4. New code has tests; modified code's tests still pass.
+5. If your change moves a perf number, the new measurement (device, command, before/after) appears in the PR description.
 
 Reviewers will look for:
 

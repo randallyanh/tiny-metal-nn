@@ -23,6 +23,33 @@ endif()
 find_package(nlohmann_json CONFIG REQUIRED)
 
 # =============================================================================
+# Optional: AddressSanitizer + UndefinedBehaviorSanitizer
+# =============================================================================
+# Build with `-DTMNN_ENABLE_SANITIZERS=ON` to instrument all targets with ASAN
+# and UBSAN. Off by default so ordinary builds and packaged releases stay
+# unchanged. Sanitizers must be applied uniformly across compile and link
+# units, hence the project-wide add_compile_options / add_link_options.
+option(TMNN_ENABLE_SANITIZERS
+    "Enable AddressSanitizer and UndefinedBehaviorSanitizer for all targets"
+    OFF)
+
+if(TMNN_ENABLE_SANITIZERS)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
+        message(WARNING "[tmnn] TMNN_ENABLE_SANITIZERS is not supported on MSVC; ignoring")
+    else()
+        message(STATUS "[tmnn] Sanitizers enabled (AddressSanitizer + UndefinedBehaviorSanitizer)")
+        add_compile_options(
+            -fsanitize=address,undefined
+            -fno-omit-frame-pointer
+            -fno-sanitize-recover=all
+        )
+        add_link_options(
+            -fsanitize=address,undefined
+        )
+    endif()
+endif()
+
+# =============================================================================
 # Library: tiny_metal_nn_core (header-only public core)
 # =============================================================================
 add_library(tiny_metal_nn_core INTERFACE)

@@ -64,6 +64,16 @@ cmake --build build -j
 ctest --test-dir build -V                                       # tests
 ```
 
+For an instrumented build with AddressSanitizer + UndefinedBehaviorSanitizer
+(off by default; consumers must rebuild any downstream code with the same
+sanitizer flags):
+
+```bash
+cmake -S . -B build-asan -DTMNN_ENABLE_SANITIZERS=ON
+cmake --build build-asan -j
+ctest --test-dir build-asan -j
+```
+
 macOS Apple Silicon is the primary target. Linux / non-Apple builds use a Metal stub (compiles, but GPU-runtime tests skip).
 
 ## Performance

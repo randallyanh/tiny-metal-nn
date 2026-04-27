@@ -41,9 +41,18 @@ target_link_libraries(tmnn_unit_tests PRIVATE
 )
 target_compile_features(tmnn_unit_tests PRIVATE cxx_std_23)
 
+# Default per-test timeout. Sanitizer-instrumented binaries run 2–5× slower,
+# so allow more wall-clock under TMNN_ENABLE_SANITIZERS to keep the slowest
+# stress tests (e.g. StressRepeatedCreateDestroy) within budget.
+if(TMNN_ENABLE_SANITIZERS)
+    set(_TMNN_TEST_TIMEOUT 600)
+else()
+    set(_TMNN_TEST_TIMEOUT 120)
+endif()
+
 gtest_discover_tests(tmnn_unit_tests
     TEST_LIST TMNN_DISCOVERED_TESTS
-    PROPERTIES TIMEOUT 120
+    PROPERTIES TIMEOUT ${_TMNN_TEST_TIMEOUT}
 )
 
 # Apply labels at CTest runtime after gtest_discover_tests has materialized the
@@ -65,6 +74,13 @@ target_compile_features(tmnn_runtime_benchmarks PRIVATE cxx_std_23)
 # Package export smoke test
 # Installs tiny_metal_nn to a temp prefix, then builds a consumer project
 # that does find_package(tiny_metal_nn) and includes the public headers.
+#
+# When TMNN_ENABLE_SANITIZERS=ON, the sanitizer flags are forwarded to the
+# consumer build as well: sanitizer-instrumented static libraries can only be
+# linked against a sanitizer-instrumented consumer (otherwise the link step
+# fails to find ASAN-wrapped runtime symbols). Forwarding the flags here
+# tests the only valid deployment mode under sanitizers, instead of skipping
+# the smoke test.
 # =============================================================================
 set(_TMNN_SMOKE_INSTALL_DIR "${CMAKE_CURRENT_BINARY_DIR}/_tmnn_smoke_install")
 set(_TMNN_SMOKE_BUILD_DIR   "${CMAKE_CURRENT_BINARY_DIR}/_tmnn_smoke_build")
@@ -78,6 +94,13 @@ set(_TMNN_SMOKE_CONFIGURE_ARGS
 if(DEFINED CMAKE_TOOLCHAIN_FILE)
     list(APPEND _TMNN_SMOKE_CONFIGURE_ARGS
         -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}
+    )
+endif()
+
+if(TMNN_ENABLE_SANITIZERS AND NOT CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
+    list(APPEND _TMNN_SMOKE_CONFIGURE_ARGS
+        "-DCMAKE_CXX_FLAGS_INIT=-fsanitize=address,undefined -fno-omit-frame-pointer"
+        "-DCMAKE_EXE_LINKER_FLAGS_INIT=-fsanitize=address,undefined"
     )
 endif()
 
