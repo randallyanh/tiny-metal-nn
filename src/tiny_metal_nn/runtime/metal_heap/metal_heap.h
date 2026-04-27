@@ -129,10 +129,13 @@ public:
   // event; pass nullptr to detach.
   void register_lane_fence_event(void *mtl_shared_event,
                                  std::uint64_t initial_value) noexcept;
-  // For caller's command buffer: signals the event with the next value at
-  // end_transient_frame(); returns the value the caller should encode as
-  // [commandBuffer encodeSignalEvent:event value:value]. Returns 0 if no
-  // event is registered.
+  // After end_transient_frame() returns, this is the signal value the lane
+  // is waiting on next time it cycles around. The caller is expected to
+  // encode it on its own command buffer:
+  //   [commandBuffer encodeSignalEvent:event value:pending_lane_signal_value()];
+  // so the GPU advances the event when prior frame work completes. Before
+  // any end_transient_frame() call (or with no event registered) this
+  // returns the registered baseline (0 if no event).
   [[nodiscard]] std::uint64_t pending_lane_signal_value() const noexcept;
 
   // Adopts an externally-owned MTLBuffer (e.g. from PyTorch MPS). Heap does
@@ -191,8 +194,12 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
-// Move-only owning view of a sub-buffer. dtor releases the underlying
-// id<MTLBuffer>; the parent Heap keeps the backing MTLHeap alive.
+// Move-only owning view of a sub-buffer. The dtor's effect is
+// lifetime-dispatched through Heap::deallocate:
+//   Persistent → releases the MTLBuffer (heap memory recycled by MTLHeap).
+//   Transient  → no-op; the lane buffer is owned by TransientRing.
+//   Staging    → returns the buffer to its size-class free list.
+//   External   → no-op; the caller owns the buffer.
 class OwnedBuffer {
 public:
   OwnedBuffer() noexcept = default;

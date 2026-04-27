@@ -461,6 +461,72 @@ TEST_F(MetalHeapTest, PendingLaneSignalValueWithoutEvent) {
   EXPECT_EQ(heap->pending_lane_signal_value(), 0u);
 }
 
+TEST_F(MetalHeapTest, OwnedBufferMovePreservesSyncEvent) {
+  auto heap = make_heap();
+  id<MTLBuffer> external =
+      [device_ newBufferWithLength:1024
+                           options:MTLResourceStorageModeShared];
+  id<MTLSharedEvent> ev = [device_ newSharedEvent];
+  ASSERT_NE(external, nil);
+  ASSERT_NE(ev, nil);
+
+  auto a = heap->adopt_external((metal_heap::MetalBuffer)external, 1024,
+                                Storage::Shared, (void *)ev, /*signal*/ 42);
+  // Move ctor copies sync_event; the source is reset to {nullptr, 0}.
+  auto b = std::move(a);
+  EXPECT_EQ(b.sync_event().event, (void *)ev);
+  EXPECT_EQ(b.sync_event().signal_value, 42u);
+  EXPECT_EQ(a.sync_event().event, nullptr);
+  EXPECT_EQ(a.sync_event().signal_value, 0u);
+
+  // Move assign overwrites the destination's sync_event.
+  id<MTLBuffer> other =
+      [device_ newBufferWithLength:512
+                           options:MTLResourceStorageModeShared];
+  auto c = heap->adopt_external((metal_heap::MetalBuffer)other, 512,
+                                Storage::Shared);
+  c = std::move(b);
+  EXPECT_EQ(c.sync_event().event, (void *)ev);
+  EXPECT_EQ(c.sync_event().signal_value, 42u);
+
+  [ev release];
+  [external release];
+  [other release];
+}
+
+// Re-registering a different event without first detaching: the per-lane
+// last_signal targets from the prior event would never be reached on the
+// new event and would deadlock the next begin_transient_frame on wrap. The
+// fix zeros lane.last_signal in register_fence; ctest's per-test TIMEOUT
+// catches a regression by killing the test rather than letting it block.
+TEST_F(MetalHeapTest, RegisterLaneFenceEventResetsLaneSignalsOnReplace) {
+  HeapConfig cfg;
+  cfg.persistent_shared_capacity_bytes  = 1024 * 1024;
+  cfg.persistent_private_capacity_bytes = 0;
+  cfg.transient_lane_bytes              = 1024 * 1024;
+  cfg.transient_lane_count              = 1;  // every begin wraps to lane 0
+  auto heap = Heap::create((MetalDevice)device_, cfg);
+  ASSERT_NE(heap, nullptr);
+
+  id<MTLSharedEvent> ev_a = [device_ newSharedEvent];
+  ASSERT_NE(ev_a, nil);
+  heap->register_lane_fence_event((void *)ev_a, 0);
+  heap->begin_transient_frame();
+  heap->end_transient_frame();  // lane[0].last_signal becomes 1 vs ev_a
+
+  id<MTLSharedEvent> ev_b = [device_ newSharedEvent];
+  ASSERT_NE(ev_b, nil);
+  heap->register_lane_fence_event((void *)ev_b, 0);
+  EXPECT_EQ(heap->pending_lane_signal_value(), 0u);
+  heap->begin_transient_frame();  // would block-forever without the reset
+  heap->end_transient_frame();
+  EXPECT_EQ(heap->pending_lane_signal_value(), 1u);
+
+  heap->register_lane_fence_event(nullptr, 0);
+  [ev_a release];
+  [ev_b release];
+}
+
 TEST_F(MetalHeapTest, RegisterLaneFenceEventAdvancesSignalOnEndFrame) {
   auto heap = make_heap();
   id<MTLSharedEvent> ev = [device_ newSharedEvent];
