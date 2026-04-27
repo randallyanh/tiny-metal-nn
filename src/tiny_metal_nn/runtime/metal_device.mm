@@ -3,6 +3,7 @@
 // =============================================================================
 
 #include "tiny_metal_nn/runtime/metal_device.h"
+#include "tiny_metal_nn/runtime/metal_obj_ptr.h"
 
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
@@ -38,46 +39,48 @@ void reset_alloc_stats() {
 DeviceInfo probe_default_device() {
   DeviceInfo info;
 
-  id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+  // device + queue are released via dtor on any early return; on success
+  // we transfer ownership into `info` via release().
+  auto device =
+      tmnn::detail::MetalObjPtr<id<MTLDevice>>::adopt(MTLCreateSystemDefaultDevice());
   if (!device)
     return info;
 
-  id<MTLCommandQueue> queue = [device newCommandQueue];
-  if (!queue) {
-    [device release];
-    return info;
-  }
+  auto queue = tmnn::detail::MetalObjPtr<id<MTLCommandQueue>>::adopt(
+      [device.get() newCommandQueue]);
+  if (!queue)
+    return info;  // device released by its dtor
 
-  info.device = TO_VOID(device);
-  info.queue = TO_VOID(queue);
-  info.name = [[device name] UTF8String];
+  info.name = [[device.get() name] UTF8String];
 
-  // GPU family detection — probe Apple GPU families.
   // MTLGPUFamilyApple7 = Apple Silicon M1+.
-  if ([device supportsFamily:MTLGPUFamilyApple7]) {
+  if ([device.get() supportsFamily:MTLGPUFamilyApple7]) {
     info.gpu_family = 7;
-  } else if ([device supportsFamily:MTLGPUFamilyApple6]) {
+  } else if ([device.get() supportsFamily:MTLGPUFamilyApple6]) {
     info.gpu_family = 6;
-  } else if ([device supportsFamily:MTLGPUFamilyApple5]) {
+  } else if ([device.get() supportsFamily:MTLGPUFamilyApple5]) {
     info.gpu_family = 5;
   } else {
     info.gpu_family = 1;
   }
 
   info.max_threads_per_tg =
-      static_cast<uint32_t>([device maxThreadsPerThreadgroup].width);
+      static_cast<uint32_t>([device.get() maxThreadsPerThreadgroup].width);
   info.max_tg_memory_bytes =
-      static_cast<uint32_t>([device maxThreadgroupMemoryLength]);
+      static_cast<uint32_t>([device.get() maxThreadgroupMemoryLength]);
 
-  // Capability probing.
-  info.supports_fp16 = true; // All Apple GPUs support FP16.
+  info.supports_fp16 = true;  // All Apple GPUs support FP16.
   info.supports_simdgroup_matrix =
-      [device supportsFamily:MTLGPUFamilyApple7];
+      [device.get() supportsFamily:MTLGPUFamilyApple7];
   info.supports_binary_archive =
-      [device supportsFamily:MTLGPUFamilyApple5];
+      [device.get() supportsFamily:MTLGPUFamilyApple5];
   info.supports_nonuniform_tgs =
-      [device supportsFamily:MTLGPUFamilyApple4];
+      [device.get() supportsFamily:MTLGPUFamilyApple4];
 
+  // Transfer +1 retain into the void* slots in info; caller releases via
+  // release_device().
+  info.device = TO_VOID(device.release());
+  info.queue = TO_VOID(queue.release());
   return info;
 }
 
@@ -128,9 +131,10 @@ void *buffer_contents(void *buffer) {
 void *create_command_buffer(void *queue) {
   if (!queue)
     return nullptr;
-  id<MTLCommandBuffer> cb = [TO_QUEUE(queue) commandBuffer];
-  [cb retain]; // commandBuffer returns autoreleased — retain for MRC
-  return TO_VOID(cb);
+  // -commandBuffer returns autoreleased; convert to +1 retained ownership.
+  auto cb = tmnn::detail::MetalObjPtr<id<MTLCommandBuffer>>::retain(
+      [TO_QUEUE(queue) commandBuffer]);
+  return TO_VOID(cb.release());
 }
 
 void commit_and_wait(void *cmd_buf) {
@@ -193,19 +197,20 @@ void *compile_pipeline(void *device, const char *msl_source,
   @autoreleasepool {
     NSError *error = nil;
     NSString *src = [NSString stringWithUTF8String:msl_source];
-    MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
+    auto opts =
+        tmnn::detail::MetalObjPtr<MTLCompileOptions *>::adopt(
+            [[MTLCompileOptions alloc] init]);
     if (precise_math) {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-      opts.fastMathEnabled = NO;
+      opts.get().fastMathEnabled = NO;
 #pragma clang diagnostic pop
     }
 
-    id<MTLLibrary> lib = [TO_DEVICE(device) newLibraryWithSource:src
-                                                         options:opts
-                                                           error:&error];
-    [opts release];
-
+    auto lib = tmnn::detail::MetalObjPtr<id<MTLLibrary>>::adopt(
+        [TO_DEVICE(device) newLibraryWithSource:src
+                                        options:opts.get()
+                                          error:&error]);
     if (!lib) {
       if (error)
         error_out = [[error localizedDescription] UTF8String];
@@ -213,27 +218,25 @@ void *compile_pipeline(void *device, const char *msl_source,
     }
 
     NSString *fname = [NSString stringWithUTF8String:function_name];
-    id<MTLFunction> func = [lib newFunctionWithName:fname];
-    [lib release];
-
+    auto func = tmnn::detail::MetalObjPtr<id<MTLFunction>>::adopt(
+        [lib.get() newFunctionWithName:fname]);
     if (!func) {
       error_out = "Function not found: ";
       error_out += function_name;
       return nullptr;
     }
 
-    id<MTLComputePipelineState> pso =
-        [TO_DEVICE(device) newComputePipelineStateWithFunction:func
-                                                         error:&error];
-    [func release];
-
+    auto pso = tmnn::detail::MetalObjPtr<id<MTLComputePipelineState>>::adopt(
+        [TO_DEVICE(device) newComputePipelineStateWithFunction:func.get()
+                                                         error:&error]);
     if (!pso) {
       if (error)
         error_out = [[error localizedDescription] UTF8String];
       return nullptr;
     }
 
-    return TO_VOID(pso); // +1 retained from newComputePipelineState
+    // Hand +1 retain to the caller; opts/lib/func release via their dtors.
+    return TO_VOID(pso.release());
   }
 }
 
