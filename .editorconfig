@@ -1,0 +1,33 @@
+# https://editorconfig.org
+#
+# Project-wide editor defaults. Aligned with `.clang-format` for C++ files.
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+# C / C++ / Objective-C++ — match .clang-format
+[*.{c,h,hpp,cc,cpp,mm,metal}]
+indent_size = 2
+
+# CMake — 4-space is the convention CMake itself uses
+[{CMakeLists.txt,*.cmake,*.cmake.in}]
+indent_size = 4
+
+# JSON — vcpkg.json and similar config files
+[*.json]
+indent_size = 2
+
+# Markdown — preserve trailing whitespace (line break conventions)
+[*.md]
+trim_trailing_whitespace = false
+
+# Makefiles must use real tabs
+[Makefile]
+indent_style = tab

@@ -1,0 +1,38 @@
+# tiny-metal-nn code style
+#
+# Captures the style the codebase already follows. Run:
+#   clang-format -i path/to/file.cpp        # apply in place
+#   clang-format -n path/to/file.cpp        # check (dry-run)
+#
+# The intent is descriptive (match existing files) rather than prescriptive;
+# if a future change wants to evolve the style, edit this file in the same PR
+# as the reformat.
+
+Language:        Cpp
+BasedOnStyle:    LLVM
+
+# 2-space indent, 80-column limit, K&R / attached braces — already the norm.
+IndentWidth:     2
+ColumnLimit:     80
+TabWidth:        2
+UseTab:          Never
+
+# Pointer / reference align with the variable name: `const T &x`, not `const T& x`.
+PointerAlignment: Right
+ReferenceAlignment: Pointer
+
+# Namespaces are not indented; matches `namespace tmnn { ... }` at column 0.
+NamespaceIndentation: None
+FixNamespaceComments: true
+
+# Keep includes in their declared groups; the codebase organizes them as
+# (project, third-party, standard).
+SortIncludes: Never
+
+# Do not reflow comments — preserves intentional line breaks in @brief / box
+# comments.
+ReflowComments: false
+
+# Constructor initializer formatting — currently consistent with LLVM defaults.
+PackConstructorInitializers: NextLine
+ConstructorInitializerIndentWidth: 4

@@ -45,9 +45,18 @@ ctest --test-dir build -V
 
 ## Code style
 
-C++:
+Formatting is captured in `.clang-format` (LLVM-derived: 2-space indent, 80-col, K&R braces, `&` attached to the variable name). For new code:
 
-- C++23. `[[nodiscard]]` on every function whose return value carries information; the codebase enforces this as a rule.
+```bash
+clang-format -i path/to/file.cpp     # format in place
+clang-format -n path/to/file.cpp     # check only
+```
+
+The existing code is mostly aligned with `.clang-format` but not perfectly; if a PR touches a file, running `clang-format` on the changed regions is welcome but reformatting unrelated code in the same PR is not.
+
+Conventions on top of formatting:
+
+- C++23. `[[nodiscard]]` on every function whose return value carries information; the codebase treats this as a rule.
 - `Result<T>` / `DiagnosticCode` for fallible APIs (see [`docs/ERROR-HANDLING.md`](docs/ERROR-HANDLING.md)). Throwing exceptions across module boundaries is reserved for unrecoverable invariant violations.
 - One thing per file when possible; prefer narrow public headers and wide-but-private implementation files.
 - File-level Doxygen `@file` + `@brief` on every source file.
