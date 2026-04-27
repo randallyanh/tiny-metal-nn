@@ -13,6 +13,7 @@
 #include "tiny_metal_nn/runtime/buffer_arena.h"
 #include "tiny_metal_nn/runtime/buffer_handle.h"
 #include "tiny_metal_nn/runtime/command_batch.h"
+#include "tiny_metal_nn/runtime/metal_heap/metal_heap.h"
 #include "tiny_metal_nn/runtime/numerics_guard.h"
 #include "tiny_metal_nn/runtime/pipeline_registry.h"
 
@@ -28,6 +29,11 @@ CommandBatchPool &context_batch_pool(MetalContext &ctx);
 
 /// Access the PipelineRegistry owned by a MetalContext.
 PipelineRegistry &context_pipeline_registry(MetalContext &ctx);
+
+/// Access the metal_heap::Heap owned by a MetalContext. Returns nullptr if
+/// no GPU device was acquired. Phase 3.1 wires this up dormant; call sites
+/// migrate over in 3.2 / 3.3.
+metal_heap::Heap *context_heap(MetalContext &ctx);
 
 /// Access the NumericsGuard owned by a MetalContext.
 NumericsGuard &context_numerics_guard(MetalContext &ctx);

@@ -15,6 +15,7 @@
 #include "tiny_metal_nn/runtime/buffer_arena.h"
 #include "tiny_metal_nn/runtime/command_batch.h"
 #include "tiny_metal_nn/runtime/metal_device.h"
+#include "tiny_metal_nn/runtime/metal_heap/metal_heap.h"
 #include "tiny_metal_nn/runtime/numerics_guard.h"
 #include "tiny_metal_nn/runtime/pipeline_registry.h"
 #include "tiny_metal_nn/runtime/runtime_policy.h"
@@ -61,6 +62,18 @@ public:
       arena_.set_device(device_info_.device);
       batch_pool_.set_queue(device_info_.queue);
       registry_.set_device(device_info_.device);
+
+      // Phase 3.1: bring up the metal_heap::Heap. Capacities are intentionally
+      // small here — call sites still go through BufferArena / metal::create_
+      // buffer in 3.1, so this is the dormant module's wiring footprint.
+      // Phase 3.2 will widen the persistent capacities once BufferArena
+      // routes through Heap::allocate(Persistent).
+      metal_heap::HeapConfig hcfg;
+      hcfg.persistent_shared_capacity_bytes  = 1 * 1024 * 1024;
+      hcfg.persistent_private_capacity_bytes = 1 * 1024 * 1024;
+      hcfg.transient_lane_count = 0;   // not yet wired
+      hcfg.staging_max_bytes    = 0;   // not yet wired
+      heap_ = metal_heap::Heap::create(device_info_.device, hcfg);
     }
   }
 
@@ -145,6 +158,7 @@ public:
   CommandBatchPool &batch_pool() { return batch_pool_; }
   PipelineRegistry &registry() { return registry_; }
   NumericsGuard &numerics_guard() { return numerics_guard_; }
+  metal_heap::Heap *heap() { return heap_.get(); }
   void record_training_step(uint64_t numerics_reports,
                             uint64_t numerics_anomalies,
                             uint64_t bad_steps_skipped,
@@ -182,6 +196,7 @@ private:
   CommandBatchPool batch_pool_;
   PipelineRegistry registry_;
   NumericsGuard numerics_guard_;
+  std::unique_ptr<metal_heap::Heap> heap_;
   mutable std::mutex autotune_mu_;
   std::unordered_map<uint64_t, AutotuneManifestEntry> autotune_entries_;
   bool gpu_available_ = false;
@@ -270,6 +285,9 @@ public:
   static NumericsGuard &numerics_guard(MetalContext &ctx) {
     return ctx.impl_->numerics_guard();
   }
+  static metal_heap::Heap *heap(MetalContext &ctx) {
+    return ctx.impl_->heap();
+  }
   static void record_training_step(MetalContext &ctx, uint64_t numerics_reports,
                                    uint64_t numerics_anomalies,
                                    uint64_t bad_steps_skipped,
@@ -305,6 +323,10 @@ CommandBatchPool &context_batch_pool(MetalContext &ctx) {
 
 PipelineRegistry &context_pipeline_registry(MetalContext &ctx) {
   return MetalContextAccessor::registry(ctx);
+}
+
+metal_heap::Heap *context_heap(MetalContext &ctx) {
+  return MetalContextAccessor::heap(ctx);
 }
 
 NumericsGuard &context_numerics_guard(MetalContext &ctx) {

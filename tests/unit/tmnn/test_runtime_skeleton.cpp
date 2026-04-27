@@ -46,6 +46,26 @@ TEST(RuntimeSkeleton, MetalContextCustomDesc) {
   EXPECT_EQ(ctx->desc().max_inflight_batches, 4u);
 }
 
+// Phase 3.1: metal_heap is wired into MetalContext but dormant — no call
+// site uses it yet. The accessor returns non-null when GPU is available so
+// 3.2's BufferArena migration has a heap to allocate against.
+TEST(RuntimeSkeleton, MetalContextHeapMatchesGpuAvailability) {
+  auto ctx = MetalContext::create();
+  auto *heap = detail::context_heap(*ctx);
+  if (ctx->is_gpu_available()) {
+    ASSERT_NE(heap, nullptr);
+    const auto stats = heap->stats();
+    EXPECT_GT(stats.persistent_shared_capacity_bytes, 0u);
+    EXPECT_GT(stats.persistent_private_capacity_bytes, 0u);
+    EXPECT_EQ(stats.live_persistent_buffers, 0u);
+    EXPECT_EQ(stats.live_transient_buffers, 0u);
+    EXPECT_EQ(stats.live_staging_buffers, 0u);
+    EXPECT_EQ(stats.live_external_buffers, 0u);
+  } else {
+    EXPECT_EQ(heap, nullptr);
+  }
+}
+
 // --- DeviceCapabilities ---
 
 TEST(RuntimeSkeleton, DeviceCapabilitiesDefaults) {
