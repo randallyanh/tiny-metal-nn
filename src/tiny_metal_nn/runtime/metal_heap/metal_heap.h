@@ -25,7 +25,10 @@ using MetalBuffer = void *;
 enum class Lifetime {
   Persistent,  // long-lived; backed by an MTLHeap, released on OwnedBuffer dtor
   Transient,   // per-frame ring lane; sub-region of a lane buffer
-  Staging,     // size-class pool for host↔device transfer; recycled on dtor
+  // Power-of-2 size-class pool for host↔device transfer. The OwnedBuffer's
+  // bytes() reports the bucket size, not the requested size, since the
+  // bucket is what gets recycled to the pool's free list on dtor.
+  Staging,
   External,    // wraps a caller-owned MTLBuffer; dtor does not release
 };
 

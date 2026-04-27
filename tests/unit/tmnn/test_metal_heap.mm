@@ -387,6 +387,36 @@ TEST_F(MetalHeapTest, AdoptExternalCarriesSyncEvent) {
   [external release];
 }
 
+TEST_F(MetalHeapTest, ZeroBytesIsInvalidConfig) {
+  auto heap = make_heap();
+  AllocDesc d = desc(0);
+  auto r = heap->allocate(d);
+  ASSERT_FALSE(r.has_value());
+  EXPECT_EQ(r.error(), AllocError::InvalidConfig);
+}
+
+TEST_F(MetalHeapTest, AdoptExternalNullReturnsInvalid) {
+  auto heap = make_heap();
+  auto buf = heap->adopt_external(nullptr, 0, Storage::Shared);
+  EXPECT_FALSE(buf.valid());
+  EXPECT_EQ(heap->stats().live_external_buffers, 0u);
+}
+
+TEST_F(MetalHeapTest, AdoptExternalPrivateHasNoCpuPointer) {
+  auto heap = make_heap();
+  id<MTLBuffer> external =
+      [device_ newBufferWithLength:1024
+                           options:MTLResourceStorageModePrivate];
+  ASSERT_NE(external, nil);
+  {
+    auto buf = heap->adopt_external((metal_heap::MetalBuffer)external,
+                                    1024, Storage::Private);
+    EXPECT_TRUE(buf.valid());
+    EXPECT_EQ(buf.cpu_data(), nullptr);
+  }
+  [external release];
+}
+
 // === Transient frame-token invalidation (Phase 2.3) ===
 
 TEST_F(MetalHeapTest, TransientFrameTokenInvalidatesAfterEndFrame) {

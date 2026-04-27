@@ -178,6 +178,9 @@ public:
     event_ = ev;
     if (event_) [event_ retain];
     next_signal_ = baseline;
+    // Drop any signal values inherited from a prior event — they would never
+    // be reached on the new event and would deadlock begin_frame on wrap.
+    for (auto &lane : lanes_) lane.last_signal = 0;
   }
 
   std::uint64_t pending_signal() const { return next_signal_; }
@@ -413,7 +416,7 @@ fail:
 
 std::expected<OwnedBuffer, AllocError>
 Heap::allocate(const AllocDesc &desc) noexcept {
-  if (!impl_ || !desc.debug_name) {
+  if (!impl_ || !desc.debug_name || desc.bytes == 0) {
     if (impl_) impl_->note_failure();
     return std::unexpected(AllocError::InvalidConfig);
   }
