@@ -103,7 +103,8 @@ if(APPLE)
         ${FOUNDATION_FRAMEWORK}
     )
     set_source_files_properties(
-        src/tiny_metal_nn/runtime/metal_device.mm PROPERTIES
+        src/tiny_metal_nn/runtime/metal_device.mm
+        src/tiny_metal_nn/runtime/metal_heap/metal_heap.mm PROPERTIES
         COMPILE_FLAGS "-fno-objc-arc"
         SKIP_PRECOMPILE_HEADERS ON
     )
@@ -164,6 +165,15 @@ install(
 install(
     DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/tiny-metal-nn
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    FILES_MATCHING PATTERN "*.h"
+)
+
+# metal_heap is a standalone, reusable module whose include path
+# (tiny_metal_nn/runtime/metal_heap/metal_heap.h) is preserved on install
+# so downstream consumers can adopt it without re-rooting the header.
+install(
+    DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/src/tiny_metal_nn/runtime/metal_heap
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/tiny_metal_nn/runtime
     FILES_MATCHING PATTERN "*.h"
 )
 

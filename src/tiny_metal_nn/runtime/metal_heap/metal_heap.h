@@ -7,8 +7,16 @@
 // tmnn-specific symbols (a CI grep gate keeps it that way), so it can be
 // lifted into another Metal project unchanged.
 //
-// Phase 2.1 ships only Lifetime::Persistent. TransientRing and StagingPool
-// land in Phase 2.2 and 2.3 respectively.
+// Threading: a Heap instance is NOT internally synchronized. All methods
+// (allocate / deallocate-via-OwnedBuffer-dtor / begin_transient_frame /
+// end_transient_frame / register_lane_fence_event / adopt_external / stats)
+// must be called from a single thread, or be externally serialized by the
+// caller. Concurrent allocate from multiple threads will corrupt the live
+// counters, the staging free lists, and the label cache. The hot transient
+// path is sub-100 ns precisely because it does no atomic / lock work; a
+// caller that needs cross-thread allocation should either run a Heap per
+// thread or wrap calls in its own mutex. Apple's MTLDevice / MTLHeap
+// themselves are thread-safe; only this wrapper is not.
 
 #include <cstddef>
 #include <cstdint>

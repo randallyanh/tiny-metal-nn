@@ -33,6 +33,10 @@
 #include "tiny-metal-nn/extension/kernel_compile_spec.h"
 #include "tiny-metal-nn/extension/training_adapter.h"
 
+// Standalone metal_heap module — included via its preserved install path so
+// downstream consumers can pick it up through find_package(tiny_metal_nn).
+#include "tiny_metal_nn/runtime/metal_heap/metal_heap.h"
+
 #include <cassert>
 #include <cstdint>
 #include <cstring>
@@ -187,6 +191,15 @@ int main() {
   assert(rotated_from_json->name() == "RotatedHashGridEncoding");
   assert(loss_from_json->name() == "L2");
   assert(optimizer_from_json->learning_rate() > 0.0f);
+
+  // metal_heap header reaches the consumer through find_package and the
+  // static factory rejects a null device without touching Metal — enough to
+  // keep the install rule honest on every CI run.
+  {
+    metal_heap::HeapConfig hcfg;
+    auto null_heap = metal_heap::Heap::create(nullptr, hcfg);
+    assert(null_heap == nullptr);
+  }
 
   // --- Public runtime / planner / manifest smoke ---
   auto ctx = tmnn::MetalContext::create();
