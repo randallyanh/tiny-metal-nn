@@ -85,7 +85,7 @@ TEST_F(MetalHeapTest, AllocateReturnsValidBufferAndStatsUpdate) {
   EXPECT_EQ(result->bytes(), 4096u);
 
   const auto s = heap->stats();
-  EXPECT_EQ(s.live_buffers, 1u);
+  EXPECT_EQ(s.live_persistent_buffers, 1u);
   EXPECT_EQ(s.total_allocations, 1u);
   EXPECT_GE(s.persistent_shared_used_bytes, 4096u);
 }
@@ -95,9 +95,9 @@ TEST_F(MetalHeapTest, DtorReleasesBufferToHeap) {
   ASSERT_NE(heap, nullptr);
   {
     auto buf = heap->allocate(desc(2048)).value();
-    EXPECT_EQ(heap->stats().live_buffers, 1u);
+    EXPECT_EQ(heap->stats().live_persistent_buffers, 1u);
   }
-  EXPECT_EQ(heap->stats().live_buffers, 0u);
+  EXPECT_EQ(heap->stats().live_persistent_buffers, 0u);
 }
 
 TEST_F(MetalHeapTest, MissingDebugNameIsInvalidConfig) {
@@ -135,16 +135,16 @@ TEST_F(MetalHeapTest, MoveCtorTransfersOwnershipNoLeak) {
   auto b = std::move(a);
   EXPECT_FALSE(a.valid());
   EXPECT_TRUE(b.valid());
-  EXPECT_EQ(heap->stats().live_buffers, 1u);
+  EXPECT_EQ(heap->stats().live_persistent_buffers, 1u);
 }
 
 TEST_F(MetalHeapTest, MoveAssignReleasesPreviousHoldsNew) {
   auto heap = make_heap();
   auto a = heap->allocate(desc(1024)).value();
   auto b = heap->allocate(desc(2048)).value();
-  EXPECT_EQ(heap->stats().live_buffers, 2u);
+  EXPECT_EQ(heap->stats().live_persistent_buffers, 2u);
   a = std::move(b);
-  EXPECT_EQ(heap->stats().live_buffers, 1u);
+  EXPECT_EQ(heap->stats().live_persistent_buffers, 1u);
   EXPECT_TRUE(a.valid());
   EXPECT_FALSE(b.valid());
 }
@@ -154,7 +154,7 @@ TEST_F(MetalHeapTest, SelfMoveAssignIsSafe) {
   auto a = heap->allocate(desc(1024)).value();
   a = std::move(a);
   EXPECT_TRUE(a.valid());
-  EXPECT_EQ(heap->stats().live_buffers, 1u);
+  EXPECT_EQ(heap->stats().live_persistent_buffers, 1u);
 }
 
 TEST_F(MetalHeapTest, PrivateStorageHasNoCpuPointer) {
@@ -271,6 +271,183 @@ TEST_F(MetalHeapTest, TransientAllocateMicrobench) {
   std::printf("[metal_heap] allocate microbench (Transient): "
               "%.0f ns/call (%d iter)\n",
               static_cast<double>(ns) / kIter, kIter);
+}
+
+// === Staging lifetime ===
+
+TEST_F(MetalHeapTest, StagingAllocateRoundsUpToBucket) {
+  auto heap = make_heap();
+  AllocDesc d = desc(700, "test.staging");
+  d.lifetime = Lifetime::Staging;
+  auto buf = heap->allocate(d).value();
+  EXPECT_NE(buf.cpu_data(), nullptr);
+  EXPECT_EQ(buf.bytes(), 1024u);  // 700 → bucket 1024
+  EXPECT_EQ(buf.lifetime(), Lifetime::Staging);
+  EXPECT_EQ(heap->stats().live_staging_buffers, 1u);
+  EXPECT_EQ(heap->stats().staging_buffers_resident, 1u);
+}
+
+TEST_F(MetalHeapTest, StagingReuseHitsFreeList) {
+  auto heap = make_heap();
+  AllocDesc d = desc(1024, "test.staging");
+  d.lifetime = Lifetime::Staging;
+  void *first_buf = nullptr;
+  {
+    auto a = heap->allocate(d).value();
+    first_buf = a.mtl_buffer();
+    EXPECT_EQ(heap->stats().staging_buffers_resident, 1u);
+  }
+  // Same bucket; pool returns the same MTLBuffer without re-allocating.
+  auto b = heap->allocate(d).value();
+  EXPECT_EQ(b.mtl_buffer(), first_buf);
+  EXPECT_EQ(heap->stats().staging_buffers_resident, 1u);
+  EXPECT_EQ(heap->stats().total_allocations, 2u);
+}
+
+TEST_F(MetalHeapTest, StagingExhaustionReturnsStagingExhausted) {
+  HeapConfig cfg;
+  cfg.persistent_shared_capacity_bytes  = 1024 * 1024;
+  cfg.persistent_private_capacity_bytes = 0;
+  cfg.transient_lane_count              = 0;
+  cfg.staging_max_bytes                 = 4096;
+  auto heap = Heap::create((MetalDevice)device_, cfg);
+  ASSERT_NE(heap, nullptr);
+
+  AllocDesc d = desc(4096, "test.staging.exhaust");
+  d.lifetime = Lifetime::Staging;
+  auto a = heap->allocate(d).value();
+  // Cap fully consumed; second concurrent acquire must fail.
+  auto r = heap->allocate(d);
+  ASSERT_FALSE(r.has_value());
+  EXPECT_EQ(r.error(), AllocError::StagingExhausted);
+}
+
+TEST_F(MetalHeapTest, StagingPrivateStorageRejected) {
+  auto heap = make_heap();
+  AllocDesc d = desc(1024, "test.staging.priv");
+  d.lifetime = Lifetime::Staging;
+  d.storage = Storage::Private;
+  auto r = heap->allocate(d);
+  ASSERT_FALSE(r.has_value());
+  EXPECT_EQ(r.error(), AllocError::UnsupportedStorage);
+}
+
+TEST_F(MetalHeapTest, StagingDisabledReturnsUnsupportedLifetime) {
+  HeapConfig cfg;
+  cfg.persistent_shared_capacity_bytes  = 1024 * 1024;
+  cfg.persistent_private_capacity_bytes = 0;
+  cfg.transient_lane_count              = 0;
+  cfg.staging_max_bytes                 = 0;  // disable staging
+  auto heap = Heap::create((MetalDevice)device_, cfg);
+  ASSERT_NE(heap, nullptr);
+  AllocDesc d = desc(1024, "test.staging.disabled");
+  d.lifetime = Lifetime::Staging;
+  auto r = heap->allocate(d);
+  ASSERT_FALSE(r.has_value());
+  EXPECT_EQ(r.error(), AllocError::UnsupportedLifetime);
+}
+
+// === adopt_external ===
+
+TEST_F(MetalHeapTest, AdoptExternalDoesNotReleaseBuffer) {
+  auto heap = make_heap();
+  id<MTLBuffer> external =
+      [device_ newBufferWithLength:2048
+                           options:MTLResourceStorageModeShared];
+  ASSERT_NE(external, nil);
+  // Caller's +1 retain. adopt_external must NOT release it on dtor.
+  {
+    auto buf = heap->adopt_external((metal_heap::MetalBuffer)external,
+                                    2048, Storage::Shared);
+    EXPECT_TRUE(buf.valid());
+    EXPECT_EQ(buf.lifetime(), Lifetime::External);
+    EXPECT_EQ(buf.mtl_buffer(), (void *)external);
+    EXPECT_NE(buf.cpu_data(), nullptr);
+    EXPECT_EQ(heap->stats().live_external_buffers, 1u);
+  }
+  EXPECT_EQ(heap->stats().live_external_buffers, 0u);
+  // External buffer still alive — touching it must not crash.
+  EXPECT_EQ([external length], 2048u);
+  [external release];
+}
+
+TEST_F(MetalHeapTest, AdoptExternalCarriesSyncEvent) {
+  auto heap = make_heap();
+  id<MTLBuffer> external =
+      [device_ newBufferWithLength:1024
+                           options:MTLResourceStorageModeShared];
+  id<MTLSharedEvent> ev = [device_ newSharedEvent];
+  ASSERT_NE(ev, nil);
+  auto buf = heap->adopt_external((metal_heap::MetalBuffer)external, 1024,
+                                  Storage::Shared, (void *)ev, /*signal*/ 7);
+  const auto se = buf.sync_event();
+  EXPECT_EQ(se.event, (void *)ev);
+  EXPECT_EQ(se.signal_value, 7u);
+  [ev release];
+  [external release];
+}
+
+// === Transient frame-token invalidation (Phase 2.3) ===
+
+TEST_F(MetalHeapTest, TransientFrameTokenInvalidatesAfterEndFrame) {
+  auto heap = make_heap();
+  heap->begin_transient_frame();
+  auto buf = heap->allocate(transient_desc(1024)).value();
+  EXPECT_TRUE(buf.valid());
+  heap->end_transient_frame();
+  // Frame counter has advanced past this allocation's token.
+  EXPECT_FALSE(buf.valid());
+}
+
+// === Cross-queue fence wiring ===
+
+TEST_F(MetalHeapTest, PendingLaneSignalValueWithoutEvent) {
+  auto heap = make_heap();
+  EXPECT_EQ(heap->pending_lane_signal_value(), 0u);
+}
+
+TEST_F(MetalHeapTest, RegisterLaneFenceEventAdvancesSignalOnEndFrame) {
+  auto heap = make_heap();
+  id<MTLSharedEvent> ev = [device_ newSharedEvent];
+  ASSERT_NE(ev, nil);
+  heap->register_lane_fence_event((void *)ev, /*baseline*/ 5);
+  EXPECT_EQ(heap->pending_lane_signal_value(), 5u);
+
+  heap->begin_transient_frame();  // first lane: last_signal == 0, no wait
+  heap->end_transient_frame();
+  EXPECT_EQ(heap->pending_lane_signal_value(), 6u);
+  // Detach so dtor does not retain a stale event reference.
+  heap->register_lane_fence_event(nullptr, 0);
+  [ev release];
+}
+
+// === Split live counters ===
+
+TEST_F(MetalHeapTest, LiveCountersSplitByLifetime) {
+  auto heap = make_heap();
+  // Persistent
+  auto p = heap->allocate(desc(1024, "test.split.p")).value();
+  // Transient
+  heap->begin_transient_frame();
+  auto t = heap->allocate(transient_desc(1024, "test.split.t")).value();
+  // Staging
+  AllocDesc sd = desc(1024, "test.split.s");
+  sd.lifetime = Lifetime::Staging;
+  auto s = heap->allocate(sd).value();
+  // External
+  id<MTLBuffer> ext =
+      [device_ newBufferWithLength:512
+                           options:MTLResourceStorageModeShared];
+  auto e = heap->adopt_external((metal_heap::MetalBuffer)ext, 512,
+                                Storage::Shared);
+
+  const auto stats = heap->stats();
+  EXPECT_EQ(stats.live_persistent_buffers, 1u);
+  EXPECT_EQ(stats.live_transient_buffers,  1u);
+  EXPECT_EQ(stats.live_staging_buffers,    1u);
+  EXPECT_EQ(stats.live_external_buffers,   1u);
+  EXPECT_EQ(stats.total_allocations, 4u);
+  [ext release];
 }
 
 static_assert(!std::is_copy_constructible_v<OwnedBuffer>);
