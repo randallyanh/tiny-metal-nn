@@ -78,6 +78,7 @@ add_library(tiny_metal_nn_runtime STATIC
     src/tiny_metal_nn/runtime/buffer_arena.cpp
     src/tiny_metal_nn/runtime/owned_buffer_handle.cpp
     src/tiny_metal_nn/runtime/command_batch.cpp
+    src/tiny_metal_nn/runtime/metal_heap/metal_heap.mm
     src/tiny_metal_nn/runtime/parameter_store.cpp
     src/tiny_metal_nn/runtime/pipeline_registry.cpp
     src/tiny_metal_nn/runtime/numerics_guard.cpp

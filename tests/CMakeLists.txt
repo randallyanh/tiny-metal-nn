@@ -12,6 +12,7 @@ add_executable(tmnn_unit_tests
     unit/tmnn/test_command_batch.cpp
     unit/tmnn/test_command_batch_error.mm
     unit/tmnn/test_metal_obj_ptr.mm
+    unit/tmnn/test_metal_heap.mm
     unit/tmnn/test_owned_buffer_handle.cpp
     unit/tmnn/test_parameter_store.cpp
     unit/tmnn/test_pipeline_registry.cpp
