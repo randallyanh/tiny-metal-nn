@@ -1,0 +1,32 @@
+build/
+.deps/
+.cache/
+a.out
+compile_commands.json
+Testing/
+.DS_Store
+
+# Static libraries
+*.a
+
+# Logs
+*.log
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+.pytest_cache/
+.hypothesis/
+
+# Internal know-how — design records, decision logs, internal strategy.
+# Not for public distribution. Lives only in working tree.
+docs/know-how/
+
+# Sample output (mlp_learning_an_image writes these to CWD)
+learned.ppm
+reference.ppm

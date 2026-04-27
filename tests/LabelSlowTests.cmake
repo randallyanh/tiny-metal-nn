@@ -1,0 +1,32 @@
+set(_TMNN_SLOW_TESTS
+  DefaultTrainer.StressRepeatedCreateDestroy
+  DefaultTrainer.StressCheckpointAfterManySteps
+  DefaultTrainer.OracleTrainingConvergesToKnownFunction
+  DefaultTrainer.OracleOptimizerBlobPreservesTrainingContinuity
+  DefaultTrainer.OracleGradientMatchesFiniteDifference
+  DefaultTrainer.OracleWeightUpdateBoundedByLearningRate
+  DefaultTrainer.OracleLossMatchesCPUComputation
+  DefaultTrainer.OptimizerBlobRoundTrips
+  DefaultTrainer.CreateTrainerWithExplicitHuberLossDeltaAffectsKernel
+  DefaultTrainer.CreateFromConfigHuberDeltaAffectsKernel
+  DefaultTrainer.AdapterLossConfigIsLowered
+  DefaultTrainer.HuberDeltaAffectsKernel
+  DefaultTrainer.SplitPathMatchesFusedPath
+  DefaultTrainer.TrainingStepProfilesSparseHashAdamByDefault
+  DefaultTrainer.LossDecreases
+  DefaultTrainer.SingleStepProducesFiniteLoss
+  DefaultTrainer.TenStepsAllFinite
+  DefaultTrainer.L1LossConverges
+  DefaultTrainer.HuberLossConverges
+  DefaultTrainer.L1WithProbesConverges
+  DefaultTrainer.HuberWithProbesConverges
+  DefaultTrainer.ProbeStillConverges
+  DefaultTrainer.ProbeEnabledReturnsLayerStats
+  DefaultTrainer.ProbeDisabledReturnsNullopt
+  DefaultTrainer.EvaluateAfterTrainingStepIsFinite
+  DefaultTrainer.EvaluateWithGradientProducesOutput
+  DefaultTrainer.ExportedEvaluatorTracksTrainingUpdates
+  DefaultTrainer.OptimizerBlobRejectsUnsupportedVersion
+)
+
+set_tests_properties(${_TMNN_SLOW_TESTS} PROPERTIES LABELS "slow;deep")

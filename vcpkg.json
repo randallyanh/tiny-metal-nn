@@ -1,0 +1,11 @@
+{
+  "name": "tiny-metal-nn",
+  "version-string": "0.0.0",
+  "description": "Metal-native, tcnn-inspired C++ library for hash-grid + MLP neural-field training and inference on Apple GPUs.",
+  "homepage": "https://github.com/randallyanh/tiny-metal-nn",
+  "license": "Apache-2.0",
+  "dependencies": [
+    "nlohmann-json",
+    "gtest"
+  ]
+}
