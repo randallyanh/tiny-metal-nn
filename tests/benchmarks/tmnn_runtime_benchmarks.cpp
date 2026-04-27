@@ -666,6 +666,78 @@ void run_cold_startup_benchmark() {
               median_ns(std::move(samples)) / 1.0e6, 3);
 }
 
+// Phase 3.0 cold-startup attribution: same workload as run_cold_startup_
+// benchmark, but with stage timing so we can see whether ctx_create,
+// create_trainer, or the first warmup step dominates the 24-ish ms total.
+// Three runs; per-stage median reported. The Phase 2 baseline target
+// (≥20% reduction) was premised on BufferArena allocation savings; this
+// flag exists to test whether that premise holds.
+void run_cold_startup_attribution() {
+  std::vector<uint64_t> ctx_samples, trainer_samples, warmup_samples,
+      total_samples;
+  ctx_samples.reserve(3);
+  trainer_samples.reserve(3);
+  warmup_samples.reserve(3);
+  total_samples.reserve(3);
+  for (int run = 0; run < 3; ++run) {
+    const auto t0 = std::chrono::steady_clock::now();
+    auto ctx = MetalContext::create();
+    if (!ctx->is_gpu_available()) {
+      std::printf("tmnn cold-startup-attribution: skipped (no GPU)\n");
+      return;
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+
+    const auto enc_cfg = default_trainer_encoding_config();
+    const auto net_cfg = default_trainer_network_config(enc_cfg);
+    const auto train_cfg = default_trainer_config();
+    auto trainer = create_trainer(enc_cfg, net_cfg, train_cfg, ctx);
+    const auto t2 = std::chrono::steady_clock::now();
+
+    const auto plan = trainer.batch_plan();
+    const int N = static_cast<int>(plan.max_batch_size);
+    std::vector<float> positions(static_cast<size_t>(N) * plan.input_dims, 0.0f);
+    std::vector<float> targets(static_cast<size_t>(N) * plan.target_dims, 0.0f);
+    auto warmup = trainer.training_step(positions.data(), targets.data(), N);
+    if (!std::isfinite(warmup.loss)) {
+      std::fprintf(stderr,
+                   "cold-startup-attribution warmup produced non-finite loss\n");
+      std::exit(1);
+    }
+    const auto t3 = std::chrono::steady_clock::now();
+
+    ctx_samples.push_back(static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
+    trainer_samples.push_back(static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count()));
+    warmup_samples.push_back(static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(t3 - t2).count()));
+    total_samples.push_back(static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(t3 - t0).count()));
+  }
+  const auto ctx_med     = median_ns(std::vector(ctx_samples)) / 1.0e6;
+  const auto trainer_med = median_ns(std::vector(trainer_samples)) / 1.0e6;
+  const auto warmup_med  = median_ns(std::vector(warmup_samples)) / 1.0e6;
+  const auto total_med   = median_ns(std::move(total_samples)) / 1.0e6;
+  std::printf("tmnn cold-startup-attribution [default-path, batch=1024]: "
+              "median total=%.3f ms\n",
+              total_med);
+  std::printf("  ctx_create     = %.3f ms (%.1f%%)\n",
+              ctx_med,     100.0 * ctx_med     / total_med);
+  std::printf("  create_trainer = %.3f ms (%.1f%%)\n",
+              trainer_med, 100.0 * trainer_med / total_med);
+  std::printf("  warmup_step    = %.3f ms (%.1f%%)\n",
+              warmup_med,  100.0 * warmup_med  / total_med);
+  std::printf("  per-run ctx_create=[%.3f,%.3f,%.3f] ms\n",
+              ctx_samples[0]/1.0e6, ctx_samples[1]/1.0e6, ctx_samples[2]/1.0e6);
+  std::printf("  per-run create_trainer=[%.3f,%.3f,%.3f] ms\n",
+              trainer_samples[0]/1.0e6, trainer_samples[1]/1.0e6,
+              trainer_samples[2]/1.0e6);
+  std::printf("  per-run warmup_step=[%.3f,%.3f,%.3f] ms\n",
+              warmup_samples[0]/1.0e6, warmup_samples[1]/1.0e6,
+              warmup_samples[2]/1.0e6);
+}
+
 // G4: wired-memory snapshot — phys_footprint before/after constructing a
 // trainer and after destroying it. Persistent reservation + per-step
 // transient capacity dominate the resident delta.
@@ -881,6 +953,7 @@ int main(int argc, char **argv) {
   bool run_neulat_latency = false;
   bool allocation_trace = false;
   bool cold_start_trace = false;
+  bool cold_start_attribution = false;
   bool wired_memory_trace = false;
   bool allocate_microbench = false;
   for (int i = 1; i < argc; ++i) {
@@ -895,6 +968,8 @@ int main(int argc, char **argv) {
       allocation_trace = true;
     else if (std::string_view(argv[i]) == "--cold-start-trace")
       cold_start_trace = true;
+    else if (std::string_view(argv[i]) == "--cold-start-attribution")
+      cold_start_attribution = true;
     else if (std::string_view(argv[i]) == "--wired-memory-trace")
       wired_memory_trace = true;
     else if (std::string_view(argv[i]) == "--allocate-microbench")
@@ -905,6 +980,10 @@ int main(int argc, char **argv) {
   // benchmark suite does not perturb the measurement.
   if (cold_start_trace) {
     run_cold_startup_benchmark();
+    return 0;
+  }
+  if (cold_start_attribution) {
+    run_cold_startup_attribution();
     return 0;
   }
   if (wired_memory_trace) {

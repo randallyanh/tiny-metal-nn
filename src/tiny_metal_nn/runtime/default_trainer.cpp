@@ -863,9 +863,28 @@ struct DefaultRuntime final : ITrainerRuntime, InspectableTrainerRuntime {
     if (!ctx_ || !ctx_->is_gpu_available())
       throw std::runtime_error("DefaultTrainerRuntime: Metal GPU not available");
 
+    // Phase 3.0 cold-startup attribution: env-gated stage timing dump,
+    // off by default. Set TMNN_PROFILE_COLDSTART=1 to print to stderr.
+    const bool profile = std::getenv("TMNN_PROFILE_COLDSTART") != nullptr;
+    using clk = std::chrono::steady_clock;
+    const auto t0 = clk::now();
     init_parameter_store();
+    const auto t1 = clk::now();
     rebuild_training_kernels();
+    const auto t2 = clk::now();
     init_step_lanes();
+    const auto t3 = clk::now();
+    if (profile) {
+      auto ms = [](clk::time_point a, clk::time_point b) {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(b - a)
+                   .count() / 1.0e6;
+      };
+      std::fprintf(stderr,
+          "[tmnn cold-startup] DefaultRuntime ctor: "
+          "init_parameter_store=%.3f ms rebuild_training_kernels=%.3f ms "
+          "init_step_lanes=%.3f ms total=%.3f ms\n",
+          ms(t0, t1), ms(t1, t2), ms(t2, t3), ms(t0, t3));
+    }
   }
 
   ~DefaultRuntime() override {
