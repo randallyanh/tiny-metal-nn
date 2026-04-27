@@ -26,9 +26,31 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/task_info.h>
+#endif
+
 namespace {
 
 using namespace tmnn;
+
+// Physical-memory footprint of this process, in bytes. Same number Activity
+// Monitor reports as "Memory". Returns 0 if unavailable (non-Apple).
+uint64_t process_phys_footprint_bytes() {
+#if defined(__APPLE__)
+  task_vm_info_data_t info{};
+  mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+  if (task_info(mach_task_self(), TASK_VM_INFO,
+                reinterpret_cast<task_info_t>(&info),
+                &count) != KERN_SUCCESS) {
+    return 0;
+  }
+  return info.phys_footprint;
+#else
+  return 0;
+#endif
+}
 
 DeviceCapabilities make_synthetic_caps() {
   DeviceCapabilities caps;
@@ -603,6 +625,122 @@ void run_default_trainer_hot_step_benchmark(bool smoke,
   run_case("large-hash default-path", large_enc_cfg, large_net_cfg, sparse_cfg);
 }
 
+// G1: cold-startup wall-clock — covers MetalContext::create() through the
+// trainer's first warmup step. Three runs; median reported. Each run uses
+// a fresh MetalContext to avoid the autotune manifest cache hiding cold
+// behaviour.
+void run_cold_startup_benchmark() {
+  std::vector<uint64_t> samples;
+  samples.reserve(3);
+  for (int run = 0; run < 3; ++run) {
+    const auto t0 = std::chrono::steady_clock::now();
+
+    auto ctx = MetalContext::create();
+    if (!ctx->is_gpu_available()) {
+      std::printf("tmnn cold-startup: skipped (no GPU)\n");
+      return;
+    }
+
+    const auto enc_cfg = default_trainer_encoding_config();
+    const auto net_cfg = default_trainer_network_config(enc_cfg);
+    const auto train_cfg = default_trainer_config();
+    auto trainer = create_trainer(enc_cfg, net_cfg, train_cfg, ctx);
+
+    const auto plan = trainer.batch_plan();
+    const int N = static_cast<int>(plan.max_batch_size);
+    std::vector<float> positions(static_cast<size_t>(N) * plan.input_dims, 0.0f);
+    std::vector<float> targets(static_cast<size_t>(N) * plan.target_dims, 0.0f);
+    auto warmup = trainer.training_step(positions.data(), targets.data(), N);
+    if (!std::isfinite(warmup.loss)) {
+      std::fprintf(stderr, "cold-startup warmup produced non-finite loss\n");
+      std::exit(1);
+    }
+
+    const auto t1 = std::chrono::steady_clock::now();
+    samples.push_back(static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0)
+            .count()));
+  }
+
+  std::printf("tmnn cold-startup [default-path, batch=1024]: median=%.3f ms runs=%d\n",
+              median_ns(std::move(samples)) / 1.0e6, 3);
+}
+
+// G4: wired-memory snapshot — phys_footprint before/after constructing a
+// trainer and after destroying it. Persistent reservation + per-step
+// transient capacity dominate the resident delta.
+void run_wired_memory_trace() {
+  const uint64_t before = process_phys_footprint_bytes();
+
+  auto ctx = MetalContext::create();
+  if (!ctx->is_gpu_available()) {
+    std::printf("tmnn wired-memory: skipped (no GPU)\n");
+    return;
+  }
+  const auto enc_cfg = default_trainer_encoding_config();
+  const auto net_cfg = default_trainer_network_config(enc_cfg);
+  const auto train_cfg = default_trainer_config();
+  {
+    auto trainer = create_trainer(enc_cfg, net_cfg, train_cfg, ctx);
+    const auto plan = trainer.batch_plan();
+    const int N = static_cast<int>(plan.max_batch_size);
+    std::vector<float> positions(static_cast<size_t>(N) * plan.input_dims, 0.0f);
+    std::vector<float> targets(static_cast<size_t>(N) * plan.target_dims, 0.0f);
+    (void)trainer.training_step(positions.data(), targets.data(), N);
+
+    const uint64_t after_construct = process_phys_footprint_bytes();
+    std::printf("tmnn wired-memory: before=%llu after_construct=%llu "
+                "delta_construct=%lld bytes\n",
+                (unsigned long long)before,
+                (unsigned long long)after_construct,
+                (long long)after_construct - (long long)before);
+  }
+  ctx.reset();
+  const uint64_t after_destroy = process_phys_footprint_bytes();
+  std::printf("tmnn wired-memory: after_destroy=%llu residual=%lld bytes\n",
+              (unsigned long long)after_destroy,
+              (long long)after_destroy - (long long)before);
+}
+
+// G5 reference upper bound: cost of a single create_buffer + release_buffer
+// pair through the existing C-style API. The future Heap::allocate() must be
+// strictly faster than this baseline (it sub-allocates from a pre-created
+// MTLHeap rather than calling the driver's main allocator).
+void run_allocate_microbench() {
+  auto ctx = MetalContext::create();
+  if (!ctx->is_gpu_available()) {
+    std::printf("tmnn allocate-microbench: skipped (no GPU)\n");
+    return;
+  }
+  // Fish device handle out of MetalContext via an arena-backed buffer so we
+  // do not need a public device accessor; the arena owns a device pointer
+  // when GPU is available.
+  // Probe a fresh device for the microbench instead of poking at the context.
+  auto info = metal::probe_default_device();
+  if (!info.device) {
+    std::printf("tmnn allocate-microbench: skipped (probe failed)\n");
+    return;
+  }
+
+  constexpr int kIterations = 10000;
+  constexpr size_t kAllocBytes = 4096;
+
+  const auto t0 = std::chrono::steady_clock::now();
+  for (int i = 0; i < kIterations; ++i) {
+    void *buf = metal::create_buffer(info.device, kAllocBytes, true);
+    metal::release_buffer(buf);
+  }
+  const auto t1 = std::chrono::steady_clock::now();
+  const auto elapsed_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+  metal::release_device(info);
+
+  std::printf("tmnn allocate-microbench [bytes=%zu, iter=%d]: "
+              "median_per_pair=%.0f ns\n",
+              kAllocBytes, kIterations,
+              static_cast<double>(elapsed_ns) / kIterations);
+}
+
 void run_neulat_latency_benchmark(bool smoke) {
   auto ctx = MetalContext::create();
   if (!ctx->is_gpu_available()) {
@@ -742,6 +880,9 @@ int main(int argc, char **argv) {
   bool only_neulat_latency = false;
   bool run_neulat_latency = false;
   bool allocation_trace = false;
+  bool cold_start_trace = false;
+  bool wired_memory_trace = false;
+  bool allocate_microbench = false;
   for (int i = 1; i < argc; ++i) {
     if (std::string_view(argv[i]) == "--smoke")
       smoke = true;
@@ -752,6 +893,27 @@ int main(int argc, char **argv) {
       only_neulat_latency = true;
     } else if (std::string_view(argv[i]) == "--allocation-trace")
       allocation_trace = true;
+    else if (std::string_view(argv[i]) == "--cold-start-trace")
+      cold_start_trace = true;
+    else if (std::string_view(argv[i]) == "--wired-memory-trace")
+      wired_memory_trace = true;
+    else if (std::string_view(argv[i]) == "--allocate-microbench")
+      allocate_microbench = true;
+  }
+
+  // Phase 2.0 baseline-only modes: each runs in isolation so the ambient
+  // benchmark suite does not perturb the measurement.
+  if (cold_start_trace) {
+    run_cold_startup_benchmark();
+    return 0;
+  }
+  if (wired_memory_trace) {
+    run_wired_memory_trace();
+    return 0;
+  }
+  if (allocate_microbench) {
+    run_allocate_microbench();
+    return 0;
   }
 
   if (!only_neulat_latency) {
