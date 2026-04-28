@@ -63,16 +63,19 @@ public:
       batch_pool_.set_queue(device_info_.queue);
       registry_.set_device(device_info_.device);
 
-      // Phase 3.1: bring up the metal_heap::Heap. Capacities are intentionally
-      // small here — call sites still go through BufferArena / metal::create_
-      // buffer in 3.1, so this is the dormant module's wiring footprint.
-      // Phase 3.2 will widen the persistent capacities once BufferArena
-      // routes through Heap::allocate(Persistent).
+      // Phase 3.1: bring up the metal_heap::Heap. BufferArena keeps its
+      // existing direct-device path (Phase 3.0 attribution showed the
+      // migration's measurable contribution was ~0.2% of cold-startup,
+      // and MTLHeap type=Automatic does not alias resources, so G4
+      // wired-memory is unchanged either way). The Heap stays available
+      // for use cases where it does deliver: external-buffer interop
+      // via adopt_external, future TransientRing hot-path consumers,
+      // and as a self-contained reusable module for downstream projects.
       metal_heap::HeapConfig hcfg;
       hcfg.persistent_shared_capacity_bytes  = 1 * 1024 * 1024;
       hcfg.persistent_private_capacity_bytes = 1 * 1024 * 1024;
-      hcfg.transient_lane_count = 0;   // not yet wired
-      hcfg.staging_max_bytes    = 0;   // not yet wired
+      hcfg.transient_lane_count = 0;
+      hcfg.staging_max_bytes    = 0;
       heap_ = metal_heap::Heap::create(device_info_.device, hcfg);
     }
   }
@@ -192,11 +195,14 @@ private:
   RuntimeStats stats_;
   mutable std::mutex stats_mu_;
   metal::DeviceInfo device_info_;
+  // heap_ MUST outlive arena_ (and any other member that holds OwnedBuffers
+  // sourced from this Heap). Members are destroyed in reverse declaration
+  // order, so heap_ is declared before arena_.
+  std::unique_ptr<metal_heap::Heap> heap_;
   BufferArena arena_;
   CommandBatchPool batch_pool_;
   PipelineRegistry registry_;
   NumericsGuard numerics_guard_;
-  std::unique_ptr<metal_heap::Heap> heap_;
   mutable std::mutex autotune_mu_;
   std::unordered_map<uint64_t, AutotuneManifestEntry> autotune_entries_;
   bool gpu_available_ = false;
