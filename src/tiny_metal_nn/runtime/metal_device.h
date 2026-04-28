@@ -45,6 +45,10 @@ struct DeviceInfo {
   bool supports_simdgroup_matrix = false;
   bool supports_binary_archive = false;
   bool supports_nonuniform_tgs = false;
+  /// MTLDevice.recommendedMaxWorkingSetSize: Apple's authoritative number
+  /// for "how much GPU memory we can comfortably use without performance
+  /// issues." Used by MetalContext to size its metal_heap::Heap.
+  uint64_t recommended_working_set_bytes = 0;
 };
 
 /// Probe system default Metal device. Returns null device on failure / non-Apple.

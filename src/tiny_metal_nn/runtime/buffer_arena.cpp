@@ -25,6 +25,10 @@ BufferArena::BufferArena(uint32_t initial_capacity) {
 
 BufferArena::~BufferArena() {
   for (auto &slot : slots_) {
+    // Heap-backed slots: OwnedBuffer dtor returns the sub-buffer to the
+    // Heap when the slot is destructed below (vector-of-SlotMeta dtor).
+    if (slot.owned.valid())
+      continue;
     if (slot.gpu_buffer) {
       metal::release_buffer(slot.gpu_buffer);
       slot.gpu_buffer = nullptr;
@@ -37,6 +41,7 @@ BufferArena::~BufferArena() {
 }
 
 void BufferArena::set_device(void *device) { device_ = device; }
+void BufferArena::set_heap(metal_heap::Heap *heap) { heap_ = heap; }
 
 // ---------------------------------------------------------------------------
 // Allocation
@@ -64,14 +69,26 @@ BufferHandle BufferArena::allocate(const BufferDesc &desc) {
   }
 
   auto &meta = slots_[slot];
+  // Shared-backing reuse fast path: a previously-released slot still holds
+  // an exact-size Shared buffer we can hand back after a memset. Heap-backed
+  // slots qualify when the cached OwnedBuffer is still valid; legacy device
+  // / calloc paths qualify on their own pointers.
   const bool can_reuse_shared_backing =
       !meta.alive && desc.storage == BufferStorage::Shared &&
       meta.storage == BufferStorage::Shared && meta.bytes == desc.bytes &&
-      ((device_ && meta.gpu_buffer && meta.cpu_data) ||
-       (!device_ && meta.cpu_data));
+      ((heap_ && meta.owned.valid()) ||
+       (!heap_ && device_ && meta.gpu_buffer && meta.cpu_data) ||
+       (!heap_ && !device_ && meta.cpu_data));
 
   if (!can_reuse_shared_backing) {
-    if (meta.gpu_buffer) {
+    // Drop whatever the slot was holding before re-binding it. For
+    // heap-backed slots the OwnedBuffer dtor already releases the MTLBuffer
+    // — DON'T also call metal::release_buffer or we double-release.
+    if (meta.owned.valid()) {
+      meta.owned = {};
+      meta.gpu_buffer = nullptr;
+      meta.cpu_data = nullptr;
+    } else if (meta.gpu_buffer) {
       metal::release_buffer(meta.gpu_buffer);
       meta.gpu_buffer = nullptr;
       meta.cpu_data = nullptr;
@@ -87,24 +104,58 @@ BufferHandle BufferArena::allocate(const BufferDesc &desc) {
   meta.debug_name = desc.debug_name;
   meta.alive = true;
 
-  // Shared buffers: MTLBuffer (if device) or calloc fallback.
-  if (desc.storage == BufferStorage::Shared && desc.bytes > 0) {
-    if (can_reuse_shared_backing) {
-      std::memset(meta.cpu_data, 0, desc.bytes);
-    } else if (device_) {
+  if (desc.bytes > 0) {
+    if (heap_) {
+      if (can_reuse_shared_backing) {
+        // MTLHeap sub-buffers are not zero-initialized on creation, but a
+        // cached Shared backing may carry stale content from its prior use.
+        // Match the legacy semantic: zero on reuse handover.
+        std::memset(meta.cpu_data, 0, desc.bytes);
+      } else {
+        metal_heap::AllocDesc hd;
+        hd.bytes = desc.bytes;
+        hd.alignment = desc.alignment ? desc.alignment : 256;
+        hd.lifetime = metal_heap::Lifetime::Persistent;
+        hd.storage = (desc.storage == BufferStorage::Shared)
+                         ? metal_heap::Storage::Shared
+                         : metal_heap::Storage::Private;
+        hd.hazard_tracking = metal_heap::HazardTracking::Untracked;
+        hd.debug_name = desc.debug_name ? desc.debug_name : "tmnn.unnamed";
+        auto r = heap_->allocate(hd);
+        if (!r.has_value()) {
+          const auto s = heap_->stats();
+          throw std::runtime_error(
+              std::string("BufferArena::allocate: metal_heap::Heap "
+                          "exhausted (want=") +
+              std::to_string(desc.bytes) + " bytes " +
+              (desc.storage == BufferStorage::Shared ? "Shared" : "Private") +
+              "; shared=" +
+              std::to_string(s.persistent_shared_used_bytes) + "/" +
+              std::to_string(s.persistent_shared_capacity_bytes) +
+              " priv=" +
+              std::to_string(s.persistent_private_used_bytes) + "/" +
+              std::to_string(s.persistent_private_capacity_bytes) +
+              "); raise MetalContextDesc.heap_config or free GPU memory");
+        }
+        meta.owned = std::move(*r);
+        meta.gpu_buffer = meta.owned.mtl_buffer();
+        meta.cpu_data = meta.owned.cpu_data();
+      }
+    } else if (desc.storage == BufferStorage::Shared) {
+      if (can_reuse_shared_backing) {
+        std::memset(meta.cpu_data, 0, desc.bytes);
+      } else if (device_) {
+        meta.gpu_buffer =
+            metal::create_buffer(device_, desc.bytes, /*shared=*/true);
+        meta.cpu_data = metal::buffer_contents(meta.gpu_buffer);
+      } else {
+        meta.cpu_data = std::calloc(1, desc.bytes);
+      }
+    } else if (desc.storage == BufferStorage::Private && device_) {
       meta.gpu_buffer =
-          metal::create_buffer(device_, desc.bytes, /*shared=*/true);
-      meta.cpu_data = metal::buffer_contents(meta.gpu_buffer);
-    } else {
-      meta.cpu_data = std::calloc(1, desc.bytes);
+          metal::create_buffer(device_, desc.bytes, /*shared=*/false);
+      // cpu_data stays nullptr — Private is GPU-only.
     }
-  }
-
-  // Private buffers: GPU-only MTLBuffer when device available.
-  if (desc.storage == BufferStorage::Private && desc.bytes > 0 && device_) {
-    meta.gpu_buffer =
-        metal::create_buffer(device_, desc.bytes, /*shared=*/false);
-    // cpu_data stays nullptr — Private is GPU-only.
   }
 
   total_bytes_ += desc.bytes;
@@ -126,15 +177,23 @@ void BufferArena::release(BufferHandle handle) {
   --live_count_;
 
   // Keep shared backing alive for reuse on a later matching allocation.
-  // Reused shared buffers are zeroed on the next allocate() before they are
-  // handed back out, so we avoid paying that cost twice during teardown.
-  if (meta.storage != BufferStorage::Shared && meta.gpu_buffer) {
-    metal::release_buffer(meta.gpu_buffer);
-    meta.gpu_buffer = nullptr;
-    meta.cpu_data = nullptr;
-  } else if (meta.storage != BufferStorage::Shared) {
-    std::free(meta.cpu_data);
-    meta.cpu_data = nullptr;
+  // Reused shared buffers are zeroed on the next allocate() before they
+  // are handed back out, so we avoid paying that cost twice during teardown.
+  // Private slots release their backing immediately; heap-backed Private
+  // slots drop the OwnedBuffer so the heap reclaims the sub-buffer.
+  if (meta.storage != BufferStorage::Shared) {
+    if (meta.owned.valid()) {
+      meta.owned = {};
+      meta.gpu_buffer = nullptr;
+      meta.cpu_data = nullptr;
+    } else if (meta.gpu_buffer) {
+      metal::release_buffer(meta.gpu_buffer);
+      meta.gpu_buffer = nullptr;
+      meta.cpu_data = nullptr;
+    } else if (meta.cpu_data) {
+      std::free(meta.cpu_data);
+      meta.cpu_data = nullptr;
+    }
   }
 
   // Bump generation so stale handles are detected.

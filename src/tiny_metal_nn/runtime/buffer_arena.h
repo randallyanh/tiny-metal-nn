@@ -11,6 +11,7 @@
  */
 
 #include "tiny_metal_nn/runtime/buffer_handle.h"
+#include "tiny_metal_nn/runtime/metal_heap/metal_heap.h"
 
 #include <cassert>
 #include <cstddef>
@@ -34,6 +35,14 @@ public:
   /// Set the Metal device for GPU buffer allocation.
   /// Called by MetalContext after device probing.
   void set_device(void *device);
+
+  /// Phase 3.2: route GPU allocations through a metal_heap::Heap. When set
+  /// AND a device is also present, allocate() goes through
+  /// Heap::allocate(Persistent) instead of metal::create_buffer; release()
+  /// drops the OwnedBuffer (or keeps Shared backings cached for slot reuse,
+  /// matching the legacy semantic). Pass nullptr to detach (calloc /
+  /// direct-MTLBuffer fallback).
+  void set_heap(metal_heap::Heap *heap);
 
   // --- Allocation ---
 
@@ -114,6 +123,10 @@ private:
     const char *debug_name = nullptr;
     void *cpu_data = nullptr;   ///< CPU backing for Shared buffers.
     void *gpu_buffer = nullptr; ///< id<MTLBuffer> when device is present.
+    /// Phase 3.2: when allocations come from a metal_heap::Heap, the
+    /// OwnedBuffer holds the lifetime. cpu_data / gpu_buffer alias into it.
+    /// Empty (default-constructed) when the slot uses the calloc fallback.
+    metal_heap::OwnedBuffer owned;
     bool alive = false;
   };
 
@@ -121,7 +134,8 @@ private:
   std::vector<uint32_t> free_list_;
   size_t total_bytes_ = 0;
   uint32_t live_count_ = 0;
-  void *device_ = nullptr; ///< id<MTLDevice>, set by MetalContext.
+  void *device_ = nullptr;            ///< id<MTLDevice>, set by MetalContext.
+  metal_heap::Heap *heap_ = nullptr;  ///< Set by MetalContext after device.
 
   void assert_valid(BufferHandle handle) const;
 };

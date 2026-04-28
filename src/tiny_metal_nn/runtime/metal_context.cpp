@@ -63,21 +63,73 @@ public:
       batch_pool_.set_queue(device_info_.queue);
       registry_.set_device(device_info_.device);
 
-      // Phase 3.1: bring up the metal_heap::Heap. BufferArena keeps its
-      // existing direct-device path (Phase 3.0 attribution showed the
-      // migration's measurable contribution was ~0.2% of cold-startup,
-      // and MTLHeap type=Automatic does not alias resources, so G4
-      // wired-memory is unchanged either way). The Heap stays available
-      // for use cases where it does deliver: external-buffer interop
-      // via adopt_external, future TransientRing hot-path consumers,
-      // and as a self-contained reusable module for downstream projects.
-      metal_heap::HeapConfig hcfg;
-      hcfg.persistent_shared_capacity_bytes  = 1 * 1024 * 1024;
-      hcfg.persistent_private_capacity_bytes = 1 * 1024 * 1024;
-      hcfg.transient_lane_count = 0;
-      hcfg.staging_max_bytes    = 0;
-      heap_ = metal_heap::Heap::create(device_info_.device, hcfg);
+      // Phase 3.2: bring up the metal_heap::Heap. By default it stays
+      // small (dormant) — BufferArena uses the legacy direct-device path
+      // and the Heap is reserved for opt-in use cases (adopt_external,
+      // future TransientRing). Set heap_config.route_buffer_arena_through_heap
+      // to true to size the Heap from MTLDevice.recommendedMaxWorkingSetSize
+      // and make BufferArena route Persistent allocations through it.
+      heap_ = make_heap_or_throw(device_info_, desc_.heap_config);
+      if (desc_.heap_config.route_buffer_arena_through_heap) {
+        arena_.set_heap(heap_.get());
+      }
     }
+  }
+
+  // Derive a metal_heap::HeapConfig from the user's MetalContextHeapConfig
+  // and the device's recommendedMaxWorkingSetSize. Hard-fails if Heap::create
+  // returns nullptr — silent degradation would just trade a clear startup
+  // error for a cryptic runtime failure later.
+  static std::unique_ptr<metal_heap::Heap>
+  make_heap_or_throw(const metal::DeviceInfo &device_info,
+                     const MetalContextHeapConfig &cfg) {
+    metal_heap::HeapConfig hcfg;
+    hcfg.transient_lane_count = 0;
+    hcfg.staging_max_bytes    = 0;
+
+    const auto derive_total = [&]() -> std::size_t {
+      const double ws = static_cast<double>(device_info.recommended_working_set_bytes);
+      const auto raw = static_cast<std::size_t>(ws * cfg.working_set_fraction);
+      return std::clamp(raw, cfg.min_total_bytes, cfg.max_total_bytes);
+    };
+
+    // Tiny dormant default when BufferArena is NOT routed through the
+    // Heap — keeps wired memory at the Phase-2 baseline. The Heap stays
+    // available for adopt_external / future TransientRing use cases.
+    constexpr std::size_t kDormantDefault = 1 * 1024 * 1024;
+
+    if (cfg.persistent_shared_capacity_bytes != 0) {
+      hcfg.persistent_shared_capacity_bytes = cfg.persistent_shared_capacity_bytes;
+    } else if (cfg.route_buffer_arena_through_heap) {
+      const auto total = derive_total();
+      hcfg.persistent_shared_capacity_bytes =
+          static_cast<std::size_t>(total * cfg.shared_share);
+    } else {
+      hcfg.persistent_shared_capacity_bytes = kDormantDefault;
+    }
+    if (cfg.persistent_private_capacity_bytes != 0) {
+      hcfg.persistent_private_capacity_bytes = cfg.persistent_private_capacity_bytes;
+    } else if (cfg.route_buffer_arena_through_heap) {
+      const auto total = derive_total();
+      hcfg.persistent_private_capacity_bytes =
+          total - static_cast<std::size_t>(total * cfg.shared_share);
+    } else {
+      hcfg.persistent_private_capacity_bytes = kDormantDefault;
+    }
+
+    auto heap = metal_heap::Heap::create(device_info.device, hcfg);
+    if (!heap) {
+      throw std::runtime_error(
+          std::string("MetalContext: metal_heap::Heap::create failed "
+                      "(shared=") +
+          std::to_string(hcfg.persistent_shared_capacity_bytes) +
+          " priv=" +
+          std::to_string(hcfg.persistent_private_capacity_bytes) +
+          " working_set=" +
+          std::to_string(device_info.recommended_working_set_bytes) +
+          " bytes); reduce MetalContextDesc.heap_config or free GPU memory");
+    }
+    return heap;
   }
 
   ~Impl() { metal::release_device(device_info_); }

@@ -10,6 +10,7 @@
 #include "tiny-metal-nn/trainer.h"
 
 #include "tiny_metal_nn/runtime/autotune_search.h"
+#include "tiny_metal_nn/runtime/metal_context_internal.h"
 #include "tiny_metal_nn/runtime/metal_device.h"
 #include "tiny_metal_nn/runtime/morton_sort.h"
 
@@ -738,13 +739,71 @@ void run_cold_startup_attribution() {
               warmup_samples[2]/1.0e6);
 }
 
+// Phase 3.2 diagnostic: probe whether MTLHeap commits memory eagerly at
+// creation or only on first sub-allocation. Creates MetalContexts with
+// progressively larger heap caps and reports phys_footprint delta. If
+// delta scales linearly with cap, MTLHeap is eager-commit and the heap
+// must be sized for actual workload (not for headroom). If delta stays
+// flat, sub-allocation drives the cost.
+void run_heap_commit_probe() {
+  const std::pair<size_t, size_t> configs[] = {
+      {  64ull * 1024 * 1024,   32ull * 1024 * 1024},  // 64 / 32
+      { 256ull * 1024 * 1024,  128ull * 1024 * 1024},  // 256 / 128
+      { 512ull * 1024 * 1024,  256ull * 1024 * 1024},  // 512 / 256
+      {1024ull * 1024 * 1024,  512ull * 1024 * 1024},  // 1024 / 512
+  };
+  std::printf("tmnn heap-commit-probe: each row is a fresh MetalContext "
+              "with the heap_config below; delta=phys_footprint(after_ctx) - "
+              "phys_footprint(before_ctx). Same row, no allocations.\n");
+  for (const auto &[shared_cap, priv_cap] : configs) {
+    const uint64_t before = process_phys_footprint_bytes();
+    MetalContextDesc desc;
+    desc.heap_config.persistent_shared_capacity_bytes  = shared_cap;
+    desc.heap_config.persistent_private_capacity_bytes = priv_cap;
+    auto ctx = MetalContext::create(desc);
+    if (!ctx->is_gpu_available()) {
+      std::printf("  skipped (no GPU)\n");
+      return;
+    }
+    const uint64_t after_create = process_phys_footprint_bytes();
+
+    // Now allocate a single 1 KB buffer to trigger first-use commit.
+    auto &arena = tmnn::detail::context_arena(*ctx);
+    auto h = arena.allocate({1024, 256, BufferStorage::Shared,
+                             BufferLifetime::Persistent, "probe"});
+    const uint64_t after_one_alloc = process_phys_footprint_bytes();
+
+    auto h2 = arena.allocate({1024, 256, BufferStorage::Private,
+                              BufferLifetime::Persistent, "probe_priv"});
+    const uint64_t after_two_alloc = process_phys_footprint_bytes();
+
+    arena.release(h);
+    arena.release(h2);
+    std::printf("  shared=%5.0f MiB priv=%5.0f MiB | "
+                "create=%6.1f MiB | +1KB shared=%6.1f MiB | "
+                "+1KB priv=%6.1f MiB\n",
+                shared_cap / 1048576.0, priv_cap / 1048576.0,
+                (after_create - before) / 1048576.0,
+                (after_one_alloc - before) / 1048576.0,
+                (after_two_alloc - before) / 1048576.0);
+    ctx.reset();
+  }
+}
+
 // G4: wired-memory snapshot — phys_footprint before/after constructing a
 // trainer and after destroying it. Persistent reservation + per-step
-// transient capacity dominate the resident delta.
+// transient capacity dominate the resident delta. Honors
+// TMNN_HEAP_SHARED_BYTES / TMNN_HEAP_PRIVATE_BYTES env vars so we can
+// probe the heap-size / wired-mem relationship under a real workload.
 void run_wired_memory_trace() {
   const uint64_t before = process_phys_footprint_bytes();
 
-  auto ctx = MetalContext::create();
+  MetalContextDesc desc;
+  if (const char *e = std::getenv("TMNN_HEAP_SHARED_BYTES"))
+    desc.heap_config.persistent_shared_capacity_bytes  = std::strtoull(e, nullptr, 10);
+  if (const char *e = std::getenv("TMNN_HEAP_PRIVATE_BYTES"))
+    desc.heap_config.persistent_private_capacity_bytes = std::strtoull(e, nullptr, 10);
+  auto ctx = MetalContext::create(desc);
   if (!ctx->is_gpu_available()) {
     std::printf("tmnn wired-memory: skipped (no GPU)\n");
     return;
@@ -766,6 +825,17 @@ void run_wired_memory_trace() {
                 (unsigned long long)before,
                 (unsigned long long)after_construct,
                 (long long)after_construct - (long long)before);
+    if (auto *heap = tmnn::detail::context_heap(*ctx)) {
+      const auto s = heap->stats();
+      std::printf("tmnn wired-memory: heap stats live_persistent=%llu "
+                  "shared_used=%zu/%zu priv_used=%zu/%zu total_alloc=%llu\n",
+                  (unsigned long long)s.live_persistent_buffers,
+                  s.persistent_shared_used_bytes,
+                  s.persistent_shared_capacity_bytes,
+                  s.persistent_private_used_bytes,
+                  s.persistent_private_capacity_bytes,
+                  (unsigned long long)s.total_allocations);
+    }
   }
   ctx.reset();
   const uint64_t after_destroy = process_phys_footprint_bytes();
@@ -954,6 +1024,7 @@ int main(int argc, char **argv) {
   bool allocation_trace = false;
   bool cold_start_trace = false;
   bool cold_start_attribution = false;
+  bool heap_commit_probe = false;
   bool wired_memory_trace = false;
   bool allocate_microbench = false;
   for (int i = 1; i < argc; ++i) {
@@ -970,6 +1041,8 @@ int main(int argc, char **argv) {
       cold_start_trace = true;
     else if (std::string_view(argv[i]) == "--cold-start-attribution")
       cold_start_attribution = true;
+    else if (std::string_view(argv[i]) == "--heap-commit-probe")
+      heap_commit_probe = true;
     else if (std::string_view(argv[i]) == "--wired-memory-trace")
       wired_memory_trace = true;
     else if (std::string_view(argv[i]) == "--allocate-microbench")
@@ -984,6 +1057,10 @@ int main(int argc, char **argv) {
   }
   if (cold_start_attribution) {
     run_cold_startup_attribution();
+    return 0;
+  }
+  if (heap_commit_probe) {
+    run_heap_commit_probe();
     return 0;
   }
   if (wired_memory_trace) {

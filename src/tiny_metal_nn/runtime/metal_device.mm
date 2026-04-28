@@ -76,6 +76,8 @@ DeviceInfo probe_default_device() {
       [device.get() supportsFamily:MTLGPUFamilyApple5];
   info.supports_nonuniform_tgs =
       [device.get() supportsFamily:MTLGPUFamilyApple4];
+  info.recommended_working_set_bytes =
+      static_cast<uint64_t>([device.get() recommendedMaxWorkingSetSize]);
 
   // Transfer +1 retain into the void* slots in info; caller releases via
   // release_device().
