@@ -2000,53 +2000,143 @@ private:
 
     // MLP weight init. counter_base offsets so hash + mlp draw from
     // disjoint streams of the same Philox seed (each thread emits 4
-    // outputs, so advance by ceil(hash_count/4) slots).
-    const std::uint32_t mlp_counter_base =
+    // outputs, so advance by ceil(elements/4) slots per dispatch).
+    std::uint32_t counter_base =
         static_cast<std::uint32_t>((hash_count + 3u) / 4u);
     if (mlp_count > 0 && mlp_view.gpu_buffer) {
-      // For Kaiming/Xavier we approximate fan_in / fan_out as hidden_dim
-      // — most layers in a FullyFusedMLP are hidden_dim × hidden_dim, so
-      // the slight under-init at the first/last boundary stays inside
-      // the typical scaling tolerance. Per-layer correct init is a
-      // future refinement.
-      const float fan_in  = static_cast<float>(spec_.hidden_dim);
-      const float fan_out = static_cast<float>(spec_.hidden_dim);
-      const float a       = wcfg.mlp_kaiming_a;
+      // P5.5: per-layer dispatch with the layer's own fan_in / fan_out.
+      // FullyFusedMLP weight layout from KernelSpec::mlpWeightCount():
+      //   layer 0:    [W0:    n_input × hidden] [b0:    hidden]
+      //   layer 1..L-1: [Wi:   hidden × hidden]  [bi:    hidden]
+      //   output layer: [Wout: hidden × n_outputs] [bout: n_outputs]
+      // Each Wi and bi is a sub-view of mlp_weights at a running byte
+      // offset.
+      //
+      // Bias init follows PyTorch's nn.Linear default:
+      // U[-1/sqrt(fan_in), 1/sqrt(fan_in)] for every layer regardless
+      // of weight init mode (except Zero mode, which zeros biases too).
+      // Matches torch.nn.Linear.reset_parameters() exactly.
+      const auto a = wcfg.mlp_kaiming_a;
+      const auto compute_kaiming_gain = [&]() -> float {
+        switch (wcfg.mlp_nonlinearity) {
+          case MlpNonlinearity::Linear:
+          case MlpNonlinearity::Sigmoid: return 1.0f;
+          case MlpNonlinearity::ReLU:    return std::sqrt(2.0f);
+          case MlpNonlinearity::LeakyReLU:
+            return std::sqrt(2.0f / (1.0f + a * a));
+          case MlpNonlinearity::Tanh:    return 5.0f / 3.0f;
+        }
+        return std::sqrt(2.0f);
+      };
+      const float gain = compute_kaiming_gain();
 
-      const auto add_uniform = [&](float low, float high) {
-        init_reqs.push_back({mlp_view, mlp_count, low, high,
-                              wcfg.seed, mlp_counter_base});
+      // Layer slicing.
+      struct LayerSlice {
+        int weight_count;
+        int bias_count;
+        int fan_in;
+        int fan_out;
       };
-      const auto add_normal = [&](float mean, float stddev) {
-        normal_reqs.push_back({mlp_view, mlp_count, mean, stddev,
-                                wcfg.seed, mlp_counter_base});
+      std::vector<LayerSlice> layers;
+      const int hd  = spec_.hidden_dim;
+      const int nin = spec_.input_dim;
+      const int nout = spec_.num_outputs;
+      layers.push_back({nin * hd, hd, nin, hd});
+      for (int i = 1; i < spec_.num_hidden_layers; ++i) {
+        layers.push_back({hd * hd, hd, hd, hd});
+      }
+      layers.push_back({hd * nout, nout, hd, nout});
+
+      std::size_t byte_offset = mlp_view.offset;
+
+      const auto sub = [&](std::size_t byte_count) {
+        BufferView v = mlp_view;
+        v.offset = byte_offset;
+        v.bytes  = byte_count;
+        v.data = mlp_view.data
+                     ? static_cast<char *>(mlp_view.data)
+                       + (byte_offset - mlp_view.offset)
+                     : nullptr;
+        return v;
       };
-      switch (wcfg.mlp_mode) {
-        case MlpInit::KaimingUniform: {
-          const float b = std::sqrt(6.0f / ((1.0f + a * a) * fan_in));
-          add_uniform(-b, b); break;
+
+      // Whole-buffer modes (Uniform/Normal/Zero) skip the per-layer
+      // path — the user explicitly opted out of fan_in scaling.
+      const bool per_layer_path =
+          wcfg.mlp_mode == MlpInit::KaimingUniform ||
+          wcfg.mlp_mode == MlpInit::KaimingNormal  ||
+          wcfg.mlp_mode == MlpInit::XavierUniform  ||
+          wcfg.mlp_mode == MlpInit::XavierNormal;
+
+      if (per_layer_path) {
+        for (const auto &L : layers) {
+          // Weight slice: per-layer fan_in.
+          if (L.weight_count > 0) {
+            BufferView wv = sub(L.weight_count * sizeof(float));
+            const float fin = static_cast<float>(L.fan_in);
+            const float fout = static_cast<float>(L.fan_out);
+            switch (wcfg.mlp_mode) {
+              case MlpInit::KaimingUniform: {
+                const float b = gain * std::sqrt(3.0f / fin);
+                init_reqs.push_back({wv, static_cast<size_t>(L.weight_count),
+                                      -b, b, wcfg.seed, counter_base});
+                break;
+              }
+              case MlpInit::KaimingNormal: {
+                const float s = gain / std::sqrt(fin);
+                normal_reqs.push_back({wv, static_cast<size_t>(L.weight_count),
+                                        0.0f, s, wcfg.seed, counter_base});
+                break;
+              }
+              case MlpInit::XavierUniform: {
+                const float b = std::sqrt(6.0f / (fin + fout));
+                init_reqs.push_back({wv, static_cast<size_t>(L.weight_count),
+                                      -b, b, wcfg.seed, counter_base});
+                break;
+              }
+              case MlpInit::XavierNormal: {
+                const float s = std::sqrt(2.0f / (fin + fout));
+                normal_reqs.push_back({wv, static_cast<size_t>(L.weight_count),
+                                        0.0f, s, wcfg.seed, counter_base});
+                break;
+              }
+              default: break;  // unreachable in this branch
+            }
+            counter_base += static_cast<std::uint32_t>(
+                (L.weight_count + 3u) / 4u);
+            byte_offset += L.weight_count * sizeof(float);
+          }
+          // Bias slice: PyTorch nn.Linear convention.
+          if (L.bias_count > 0) {
+            BufferView bv = sub(L.bias_count * sizeof(float));
+            const float fin = static_cast<float>(L.fan_in);
+            const float b = (fin > 0.0f) ? 1.0f / std::sqrt(fin) : 0.0f;
+            init_reqs.push_back({bv, static_cast<size_t>(L.bias_count),
+                                  -b, b, wcfg.seed, counter_base});
+            counter_base += static_cast<std::uint32_t>(
+                (L.bias_count + 3u) / 4u);
+            byte_offset += L.bias_count * sizeof(float);
+          }
         }
-        case MlpInit::XavierUniform: {
-          const float b = std::sqrt(6.0f / (fan_in + fan_out));
-          add_uniform(-b, b); break;
+      } else {
+        // Whole-buffer single-shot for plain Uniform / Normal / Zero.
+        switch (wcfg.mlp_mode) {
+          case MlpInit::Uniform:
+            init_reqs.push_back({mlp_view, mlp_count,
+                                  -wcfg.mlp_uniform_range,
+                                   wcfg.mlp_uniform_range,
+                                  wcfg.seed, counter_base});
+            break;
+          case MlpInit::Normal:
+            normal_reqs.push_back({mlp_view, mlp_count, 0.0f,
+                                    wcfg.mlp_normal_stddev,
+                                    wcfg.seed, counter_base});
+            break;
+          case MlpInit::Zero:
+            zero_views.push_back(mlp_view);
+            break;
+          default: break;  // unreachable
         }
-        case MlpInit::Uniform:
-          add_uniform(-wcfg.mlp_uniform_range, wcfg.mlp_uniform_range);
-          break;
-        case MlpInit::KaimingNormal: {
-          // stddev = sqrt(2 / ((1+a²) * fan_in))
-          const float s = std::sqrt(2.0f / ((1.0f + a * a) * fan_in));
-          add_normal(0.0f, s); break;
-        }
-        case MlpInit::XavierNormal: {
-          const float s = std::sqrt(2.0f / (fan_in + fan_out));
-          add_normal(0.0f, s); break;
-        }
-        case MlpInit::Normal:
-          add_normal(0.0f, wcfg.mlp_normal_stddev);
-          break;
-        case MlpInit::Zero:
-          zero_views.push_back(mlp_view); break;
       }
     }
 
