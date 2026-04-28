@@ -1973,7 +1973,10 @@ private:
 
     // Build one batch of init dispatches + a list of buffers needing
     // zero-fill (Zero mode goes through context_blit_fill_views).
+    // Normal-mode requests go to a parallel batch dispatched on the
+    // dedicated Box-Muller kernel.
     std::vector<detail::InitUniformRequest> init_reqs;
+    std::vector<detail::InitNormalRequest>  normal_reqs;
     std::vector<BufferView> zero_views;
 
     // Hash grid.
@@ -2010,6 +2013,10 @@ private:
         init_reqs.push_back({mlp_view, mlp_count, low, high,
                               wcfg.seed, mlp_counter_base});
       };
+      const auto add_normal = [&](float mean, float stddev) {
+        normal_reqs.push_back({mlp_view, mlp_count, mean, stddev,
+                                wcfg.seed, mlp_counter_base});
+      };
       switch (wcfg.mlp_mode) {
         case MlpInit::KaimingUniform: {
           const float b = std::sqrt(6.0f / ((1.0f + a * a) * fan_in));
@@ -2022,18 +2029,20 @@ private:
         case MlpInit::Uniform:
           add_uniform(-wcfg.mlp_uniform_range, wcfg.mlp_uniform_range);
           break;
+        case MlpInit::KaimingNormal: {
+          // stddev = sqrt(2 / ((1+a²) * fan_in))
+          const float s = std::sqrt(2.0f / ((1.0f + a * a) * fan_in));
+          add_normal(0.0f, s); break;
+        }
+        case MlpInit::XavierNormal: {
+          const float s = std::sqrt(2.0f / (fan_in + fan_out));
+          add_normal(0.0f, s); break;
+        }
+        case MlpInit::Normal:
+          add_normal(0.0f, wcfg.mlp_normal_stddev);
+          break;
         case MlpInit::Zero:
           zero_views.push_back(mlp_view); break;
-        // P5.3: KaimingNormal / XavierNormal / Normal ride a future
-        // Box-Muller variant of the Philox kernel. For now fall back
-        // to KaimingUniform-equivalent so configs that selected those
-        // modes still receive a sensible (if not exact) initializer.
-        case MlpInit::KaimingNormal:
-        case MlpInit::XavierNormal:
-        case MlpInit::Normal: {
-          const float b = std::sqrt(6.0f / ((1.0f + a * a) * fan_in));
-          add_uniform(-b, b); break;
-        }
       }
     }
 
@@ -2046,6 +2055,13 @@ private:
           *ctx_,
           std::span<const detail::InitUniformRequest>(
               init_reqs.data(), init_reqs.size()),
+          /*wait_for_completion=*/true);
+    }
+    if (!normal_reqs.empty()) {
+      detail::context_dispatch_init_normal_views(
+          *ctx_,
+          std::span<const detail::InitNormalRequest>(
+              normal_reqs.data(), normal_reqs.size()),
           /*wait_for_completion=*/true);
     }
     if (!zero_views.empty()) {

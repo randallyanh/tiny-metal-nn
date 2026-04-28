@@ -794,6 +794,87 @@ kernel void init_uniform_philox(
 // won't collide with the KernelCompiler's training-kernel hashes.
 constexpr std::uint64_t kInitUniformPipelineHash = 0xC0FFEE5070A0501ull;
 
+// Phase 5.3: Box-Muller normal-distribution kernel. Each thread does
+// one Philox call (4 uniforms u1,u2,u3,u4), pairs them as (u1,u2) and
+// (u3,u4), and applies Box-Muller to emit 4 normals.
+constexpr const char *kInitNormalPhiloxMSL = R"MSL(
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint32_t PHILOX_M0 = 0xD2511F53u;
+constant uint32_t PHILOX_M1 = 0xCD9E8D57u;
+constant uint32_t PHILOX_W0 = 0x9E3779B9u;
+constant uint32_t PHILOX_W1 = 0xBB67AE85u;
+constant float    TWO_PI    = 6.28318530718f;
+// Floor for u1 so log(u1) stays finite when Philox yields the all-zero
+// uint32 (vanishingly unlikely but not impossible).
+constant float    EPS_U1    = 1.0e-30f;
+
+inline uint4 philox_round(uint4 ctr, uint2 key) {
+  uint64_t p0 = (uint64_t)PHILOX_M0 * (uint64_t)ctr.x;
+  uint64_t p1 = (uint64_t)PHILOX_M1 * (uint64_t)ctr.z;
+  uint32_t hi0 = uint32_t(p0 >> 32), lo0 = uint32_t(p0);
+  uint32_t hi1 = uint32_t(p1 >> 32), lo1 = uint32_t(p1);
+  return uint4(hi1 ^ ctr.y ^ key.x, lo1, hi0 ^ ctr.w ^ key.y, lo0);
+}
+inline uint4 philox_4x32_10(uint4 ctr, uint2 key) {
+  for (int i = 0; i < 10; ++i) {
+    ctr = philox_round(ctr, key);
+    key = uint2(key.x + PHILOX_W0, key.y + PHILOX_W1);
+  }
+  return ctr;
+}
+
+struct InitNormalParams {
+  uint32_t key0;
+  uint32_t key1;
+  uint32_t counter_base;
+  uint32_t element_count;
+  float mean;
+  float stddev;
+};
+
+kernel void init_normal_philox(
+    device float *out [[buffer(0)]],
+    constant InitNormalParams &p [[buffer(1)]],
+    uint tid [[thread_position_in_grid]])
+{
+  uint4 ctr = uint4(p.counter_base + tid, 0u, 0u, 0u);
+  uint2 key = uint2(p.key0, p.key1);
+  uint4 r = philox_4x32_10(ctr, key);
+
+  // Convert to [0, 1). Clamp u1/u3 away from 0 so log() is finite.
+  const float kScale = 1.0f / 4294967296.0f;
+  float u1 = max(float(r.x) * kScale, EPS_U1);
+  float u2 = float(r.y) * kScale;
+  float u3 = max(float(r.z) * kScale, EPS_U1);
+  float u4 = float(r.w) * kScale;
+
+  // Box-Muller: (u1, u2) → (z0, z1); (u3, u4) → (z2, z3).
+  float radius1 = sqrt(-2.0f * log(u1));
+  float radius2 = sqrt(-2.0f * log(u3));
+  float z0 = radius1 * cos(TWO_PI * u2);
+  float z1 = radius1 * sin(TWO_PI * u2);
+  float z2 = radius2 * cos(TWO_PI * u4);
+  float z3 = radius2 * sin(TWO_PI * u4);
+  float4 v = float4(p.mean) + float4(p.stddev) * float4(z0, z1, z2, z3);
+
+  uint base = tid * 4u;
+  if (base + 4u <= p.element_count) {
+    out[base + 0u] = v.x;
+    out[base + 1u] = v.y;
+    out[base + 2u] = v.z;
+    out[base + 3u] = v.w;
+  } else {
+    if (base + 0u < p.element_count) out[base + 0u] = v.x;
+    if (base + 1u < p.element_count) out[base + 1u] = v.y;
+    if (base + 2u < p.element_count) out[base + 2u] = v.z;
+  }
+}
+)MSL";
+
+constexpr std::uint64_t kInitNormalPipelineHash = 0xC0FFEE5070A0502ull;
+
 }  // namespace
 
 // Per-dispatch params layout matching the MSL `InitParams` struct.
@@ -911,6 +992,102 @@ void context_dispatch_init_uniform(MetalContext &ctx,
   context_dispatch_init_uniform_views(
       ctx, std::span<const InitUniformRequest>(&req, 1),
       wait_for_completion);
+}
+
+// Mirror of context_dispatch_init_uniform_views for the Normal-mode
+// kernel. Same Pending struct + per-request param layout, just a
+// different MSL entry point and a different params struct.
+struct InitNormalParamsLayout {
+  std::uint32_t key0;
+  std::uint32_t key1;
+  std::uint32_t counter_base;
+  std::uint32_t element_count;
+  float mean;
+  float stddev;
+};
+
+static void *resolve_init_normal_pipeline(MetalContext &ctx) {
+  auto &reg = MetalContextAccessor::registry(ctx);
+  PipelineKey pkey{kInitNormalPipelineHash, "init_normal_philox",
+                   /*precise_math=*/false, /*binding_count=*/2,
+                   /*threadgroup_memory_bytes=*/0};
+  auto pso = reg.register_pipeline(pkey, kInitNormalPhiloxMSL,
+                                   "init_normal_philox");
+  return reg.raw_pipeline(pso);
+}
+
+void context_dispatch_init_normal_views(
+    MetalContext &ctx, std::span<const InitNormalRequest> reqs,
+    bool wait_for_completion) {
+  if (!ctx.is_gpu_available() || reqs.empty()) return;
+
+  void *pso = resolve_init_normal_pipeline(ctx);
+  if (!pso) {
+    throw std::runtime_error(
+        "context_dispatch_init_normal_views: failed to compile init kernel");
+  }
+
+  struct PerReq {
+    const InitNormalRequest *req;
+    std::uint32_t param_offset;
+    std::uint32_t threads;
+  };
+  std::vector<PerReq> active;
+  active.reserve(reqs.size());
+  for (const auto &r : reqs) {
+    if (!r.dst.gpu_buffer || r.element_count == 0) continue;
+    active.push_back(
+        {&r,
+         static_cast<std::uint32_t>(active.size() *
+                                    sizeof(InitNormalParamsLayout)),
+         static_cast<std::uint32_t>((r.element_count + 3u) / 4u)});
+  }
+  if (active.empty()) return;
+
+  const std::size_t param_buf_bytes =
+      active.size() * sizeof(InitNormalParamsLayout);
+  void *param_buf = metal::create_buffer(context_raw_device(ctx),
+                                         param_buf_bytes, /*shared=*/true);
+  if (!param_buf) {
+    throw std::runtime_error(
+        "context_dispatch_init_normal_views: param staging alloc failed");
+  }
+  auto *param_data = static_cast<InitNormalParamsLayout *>(
+      metal::buffer_contents(param_buf));
+  for (std::size_t i = 0; i < active.size(); ++i) {
+    const auto &r = *active[i].req;
+    param_data[i] = {
+        static_cast<std::uint32_t>(r.seed & 0xFFFFFFFFu),
+        static_cast<std::uint32_t>((r.seed >> 32) & 0xFFFFFFFFu),
+        r.counter_base,
+        static_cast<std::uint32_t>(r.element_count),
+        r.mean, r.stddev,
+    };
+  }
+
+  constexpr std::uint32_t kTgSize = 256u;
+  auto *cmd = metal::create_command_buffer(context_raw_queue(ctx));
+  for (const auto &p : active) {
+    metal::DispatchDesc::BufferBind binds[2] = {
+        {p.req->dst.gpu_buffer,
+         static_cast<std::uint32_t>(p.req->dst.offset), 0u},
+        {param_buf, p.param_offset, 1u},
+    };
+    metal::DispatchDesc dd{
+        cmd, pso, binds, /*binding_count=*/2u,
+        p.threads, 1u, 1u,
+        kTgSize,   1u, 1u,
+        0u,
+    };
+    metal::encode_dispatch(dd);
+  }
+  if (wait_for_completion) {
+    metal::commit_and_wait(cmd);
+  } else {
+    metal::commit_async(cmd);
+  }
+  metal::release_command_buffer(cmd);
+  metal::release_buffer(param_buf);
 }
 
 } // namespace detail

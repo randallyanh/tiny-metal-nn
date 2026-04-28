@@ -135,6 +135,22 @@ void context_dispatch_init_uniform_views(
     std::span<const InitUniformRequest> reqs,
     bool wait_for_completion = true);
 
+/// Phase 5.3: Normal-distribution variant. Uses Box-Muller on two pairs
+/// of Philox uniforms per thread to emit 4 normals. Normal(mean, stddev)
+/// = mean + stddev * z, where z ~ N(0, 1).
+struct InitNormalRequest {
+  BufferView dst;
+  std::size_t element_count;
+  float mean;
+  float stddev;
+  std::uint64_t seed;
+  std::uint32_t counter_base;
+};
+void context_dispatch_init_normal_views(
+    MetalContext &ctx,
+    std::span<const InitNormalRequest> reqs,
+    bool wait_for_completion = true);
+
 /// Upload host bytes into a GPU-only buffer view via a staging blit.
 void context_blit_upload(MetalContext &ctx, BufferView &dst, const void *data,
                          size_t bytes);

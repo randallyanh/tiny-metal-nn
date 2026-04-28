@@ -390,6 +390,50 @@ TEST(RuntimeSkeleton, InitUniformPhiloxKernelProducesUniform) {
   EXPECT_TRUE(any_diff);
 }
 
+// Phase 5.3: Box-Muller normal-distribution kernel correctness.
+//   * Sample mean ≈ requested mean
+//   * Sample stddev ≈ requested stddev
+//   * No NaN / Inf (Box-Muller is well-behaved if u1 stays clamped > 0)
+//   * Same-seed reproducibility
+TEST(RuntimeSkeleton, InitNormalPhiloxKernelProducesNormal) {
+  auto ctx = MetalContext::create();
+  if (!ctx->is_gpu_available())
+    GTEST_SKIP() << "No GPU";
+  auto &arena = detail::context_arena(*ctx);
+
+  constexpr size_t kN = 65536;
+  auto h = arena.allocate({kN * sizeof(float), 256, BufferStorage::Shared,
+                           BufferLifetime::Persistent, "init_normal_test"});
+  auto v = arena.view(h);
+
+  detail::InitNormalRequest req{v, kN, /*mean=*/0.5f, /*stddev=*/2.0f,
+                                /*seed=*/42u, /*counter_base=*/0u};
+  detail::context_dispatch_init_normal_views(
+      *ctx, std::span<const detail::InitNormalRequest>(&req, 1));
+
+  const auto *out = static_cast<const float *>(v.data);
+  double sum = 0.0, sq = 0.0;
+  for (size_t i = 0; i < kN; ++i) {
+    ASSERT_TRUE(std::isfinite(out[i])) << "i=" << i;
+    sum += out[i];
+    sq += static_cast<double>(out[i]) * out[i];
+  }
+  const double mean = sum / kN;
+  const double var  = sq / kN - mean * mean;
+  // Sampling tolerance for kN = 65536: std error of mean ≈ 2 / sqrt(N)
+  // ≈ 0.008. We allow 0.05 to keep the test robust.
+  EXPECT_NEAR(mean, 0.5, 0.05);
+  EXPECT_NEAR(std::sqrt(var), 2.0, 0.05);
+
+  // Reproducibility (same seed → same bytes).
+  std::vector<float> snapshot(out, out + kN);
+  detail::context_dispatch_init_normal_views(
+      *ctx, std::span<const detail::InitNormalRequest>(&req, 1));
+  for (size_t i = 0; i < kN; ++i) {
+    ASSERT_EQ(out[i], snapshot[i]) << "i=" << i;
+  }
+}
+
 // counter_base offsets the per-thread Philox counter so two call sites
 // (e.g. hash grid + MLP) can draw from non-overlapping streams of the
 // same seed without correlation.
