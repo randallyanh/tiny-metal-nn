@@ -29,31 +29,42 @@ class MetalContextAccessor;
 } // namespace detail
 
 /// Phase 3.2: heap-budget configuration for the metal_heap::Heap that
-/// MetalContext owns. By default the Heap stays available for opt-in use
-/// cases (adopt_external, future TransientRing consumers) at minimal
-/// wired-memory cost; set route_buffer_arena_through_heap = true to make
-/// BufferArena allocate Persistent buffers from the Heap.
+/// MetalContext owns. By default BufferArena routes Persistent
+/// allocations through the Heap (sized from
+/// MTLDevice.recommendedMaxWorkingSetSize) so the SOTA allocator path
+/// is exercised out-of-the-box. Override
+/// route_buffer_arena_through_heap = false on memory-constrained
+/// systems (≤ 8 GB Apple Silicon) where the wired-mem cost matters.
 ///
 /// IMPORTANT (Apple Silicon trade-off): MTLHeap commits its full backing
 /// region the moment the GPU first binds a sub-buffer, then keeps that
-/// region resident for the heap's lifetime. So with
+/// region resident for the heap's lifetime. So with the default
 /// route_buffer_arena_through_heap = true, wired_memory delta_construct
-/// rises from ~24 MiB to ~heap_capacity (≈ 1 GiB on the default config).
-/// In return, per-buffer allocation latency drops from ~1180 ns to
-/// ~340 ns. For tmnn's <100-buffer-per-trainer workload that's a 0.2 %
-/// cold-startup win for a 44× wired-mem cost, so it's off by default —
-/// turn it on if your workload has high-frequency dynamic buffer
-/// creation (e.g. interactive editing, autotune sweeps, MPS interop).
+/// is ~heap_capacity (≈ 1 GiB on the default 30/70 split). In return
+/// per-allocation latency drops from ~1180 ns to ~340 ns. The cost is
+/// ~3 % of total memory on a 32 GB system, ~6 % on 16 GB, ~12 % on
+/// 8 GB — set route_buffer_arena_through_heap = false to keep the
+/// Phase 2 wired-mem profile (~24 MiB delta_construct) on the lower
+/// memory tiers; the Heap remains available for adopt_external and
+/// future TransientRing consumers regardless of the routing choice.
 struct MetalContextHeapConfig {
-  // Default OFF: BufferArena uses metal::create_buffer per slot, which
-  // matches the pre-3.2 wired-mem profile. The Heap is still created at
-  // a small size for adopt_external + future TransientRing.
-  bool route_buffer_arena_through_heap = false;
+  // Default ON: BufferArena routes through metal_heap::Heap (sized
+  // from the device's recommended working set). Set false on
+  // memory-constrained systems — the comment block above explains the
+  // wired-memory trade-off in detail.
+  bool route_buffer_arena_through_heap = true;
 
   // Explicit capacities (non-zero = use verbatim, in bytes). Used in
   // both modes; auto-derivation is skipped when these are non-zero.
   size_t persistent_shared_capacity_bytes = 0;
   size_t persistent_private_capacity_bytes = 0;
+
+  // Staging pool ceiling. 0 = use the 32 MiB default. The cap is a
+  // CEILING, not eager reservation: bucket buffers commit only as
+  // context_blit_*_views requests them, and they're released back to a
+  // size-class free list (not re-allocated) on the next call. Persistently
+  // non-zero AllocStats.staging_fallback_count signals this is undersized.
+  size_t staging_capacity_bytes = 0;
 
   // Auto-derivation parameters (consulted only when the corresponding
   // explicit capacity above is 0):

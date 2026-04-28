@@ -11,6 +11,8 @@
 #include "tiny-metal-nn/kernels/kernel_compiler.h"
 #include "tiny-metal-nn/kernels/kernel_spec.h"
 #include "tiny_metal_nn/runtime/default_trainer_policy.h"
+#include "tiny_metal_nn/runtime/metal_context_internal.h"
+#include "tiny_metal_nn/runtime/metal_device.h"
 
 #include <cmath>
 #include <cstring>
@@ -914,6 +916,49 @@ TEST(DefaultTrainer, OptimizerBlobRoundTrips) {
   EXPECT_EQ(round_tripped.version, exported.version);
   EXPECT_EQ(round_tripped.step, exported.step);
   EXPECT_EQ(round_tripped.payload, exported.payload);
+}
+
+// Phase 4 followup: pin that the metal_heap::Staging pool is actually
+// being used by context_blit_*_views — assert post-checkpoint that the
+// pool has resident buffers AND the fallback counter stayed at zero.
+// Without this test, a silent regression to the per-call create_buffer
+// fallback would still pass functional round-trip but lose the pool's
+// free-list reuse win.
+TEST(DefaultTrainer, OptimizerBlobUsesStagingPool) {
+  auto ctx = MetalContext::create();
+  if (!ctx->is_gpu_available())
+    GTEST_SKIP() << "No GPU";
+
+  // Reset the global counter before the round-trip so the assertion
+  // measures only this test's traffic.
+  tmnn::metal::reset_alloc_stats();
+
+  auto trainer = create_trainer({}, small_net(), {.batch_size = 256}, ctx);
+  const auto plan = trainer.batch_plan();
+
+  std::vector<float> positions, targets;
+  make_sphere_batch(static_cast<int>(plan.max_batch_size),
+                    static_cast<int>(plan.input_dims), positions, targets);
+  (void)trainer.training_step(positions.data(), targets.data(),
+                              static_cast<int>(plan.max_batch_size));
+
+  // Drive at least one checkpoint round-trip through the batched helpers.
+  auto blob = trainer.export_optimizer_state();
+  trainer.import_optimizer_state(blob);
+
+  auto *heap = detail::context_heap(*ctx);
+  ASSERT_NE(heap, nullptr);
+  const auto hs = heap->stats();
+  EXPECT_GT(hs.staging_buffers_resident, 0u)
+      << "Staging pool should have at least one bucket resident after a "
+         "checkpoint round-trip — context_blit_*_views may have "
+         "regressed to the create_buffer fallback path";
+
+  EXPECT_EQ(tmnn::metal::alloc_stats().staging_fallback_count.load(
+                std::memory_order_relaxed),
+            0u)
+      << "Staging fallback fired during a normal-sized checkpoint — "
+         "raise heap_config.staging_capacity_bytes if this is expected";
 }
 
 // Phase 4 audit: pin the Shared-buffer round-trip path. The default

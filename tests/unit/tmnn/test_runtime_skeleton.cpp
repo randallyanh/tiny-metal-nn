@@ -48,23 +48,25 @@ TEST(RuntimeSkeleton, MetalContextCustomDesc) {
   EXPECT_EQ(ctx->desc().max_inflight_batches, 4u);
 }
 
-// Phase 3.2: by default the Heap stays dormant — small reservation,
-// BufferArena unchanged. Opt-in routing via
-// heap_config.route_buffer_arena_through_heap for high-frequency
-// allocation workloads.
-TEST(RuntimeSkeleton, MetalContextHeapDefaultIsDormant) {
+// Phase 3.2 (default ON since this checkout): BufferArena routes
+// Persistent allocations through the Heap. Capacity derives from
+// MTLDevice.recommendedMaxWorkingSetSize, clamped to the documented
+// 1 GiB floor / 4 GiB ceiling.
+TEST(RuntimeSkeleton, MetalContextHeapDefaultIsRouted) {
   auto ctx = MetalContext::create();
   auto *heap = detail::context_heap(*ctx);
   if (ctx->is_gpu_available()) {
     ASSERT_NE(heap, nullptr);
     const auto stats = heap->stats();
-    // Dormant: tiny reservation so wired_memory matches pre-3.2 baseline.
-    // The Heap remains reachable for adopt_external etc.
+    // Default 30/70 split with 1 GiB floor.
+    EXPECT_GE(stats.persistent_shared_capacity_bytes,
+              300ull * 1024 * 1024);
     EXPECT_LE(stats.persistent_shared_capacity_bytes,
-              16ull * 1024 * 1024);
+              4ull * 1024 * 1024 * 1024);
+    EXPECT_GE(stats.persistent_private_capacity_bytes,
+              700ull * 1024 * 1024);
     EXPECT_LE(stats.persistent_private_capacity_bytes,
-              16ull * 1024 * 1024);
-    EXPECT_EQ(stats.live_persistent_buffers, 0u);
+              4ull * 1024 * 1024 * 1024);
     EXPECT_EQ(stats.live_transient_buffers, 0u);
     EXPECT_EQ(stats.live_staging_buffers, 0u);
     EXPECT_EQ(stats.live_external_buffers, 0u);
@@ -73,25 +75,32 @@ TEST(RuntimeSkeleton, MetalContextHeapDefaultIsDormant) {
   }
 }
 
-// Routed mode: heap derives capacity from MTLDevice.recommendedMaxWorkingSetSize
-// and BufferArena allocates against it.
-TEST(RuntimeSkeleton, MetalContextHeapRoutedSizesFromWorkingSet) {
+// Explicit opt-out: route_buffer_arena_through_heap = false keeps the
+// Heap dormant (tiny reservation) so wired_memory matches the pre-3.2
+// baseline on memory-constrained systems.
+TEST(RuntimeSkeleton, MetalContextHeapOptOutIsDormant) {
   MetalContextDesc desc;
-  desc.heap_config.route_buffer_arena_through_heap = true;
+  desc.heap_config.route_buffer_arena_through_heap = false;
   auto ctx = MetalContext::create(desc);
   if (!ctx->is_gpu_available()) GTEST_SKIP() << "No GPU";
   auto *heap = detail::context_heap(*ctx);
   ASSERT_NE(heap, nullptr);
   const auto stats = heap->stats();
-  // Default 30/70 split with 1 GiB floor.
-  EXPECT_GE(stats.persistent_shared_capacity_bytes,
-            300ull * 1024 * 1024);
   EXPECT_LE(stats.persistent_shared_capacity_bytes,
-            4ull * 1024 * 1024 * 1024);
-  EXPECT_GE(stats.persistent_private_capacity_bytes,
-            700ull * 1024 * 1024);
+            16ull * 1024 * 1024);
   EXPECT_LE(stats.persistent_private_capacity_bytes,
-            4ull * 1024 * 1024 * 1024);
+            16ull * 1024 * 1024);
+}
+
+// Staging cap override: explicit value lands verbatim.
+TEST(RuntimeSkeleton, MetalContextStagingCapacityOverride) {
+  MetalContextDesc desc;
+  desc.heap_config.staging_capacity_bytes = 8ull * 1024 * 1024;
+  auto ctx = MetalContext::create(desc);
+  if (!ctx->is_gpu_available()) GTEST_SKIP() << "No GPU";
+  auto *heap = detail::context_heap(*ctx);
+  ASSERT_NE(heap, nullptr);
+  EXPECT_EQ(heap->stats().staging_capacity_bytes, 8ull * 1024 * 1024);
 }
 
 // Heap capacity overrides land verbatim — for memory-constrained

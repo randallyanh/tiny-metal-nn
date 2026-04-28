@@ -26,6 +26,12 @@ struct AllocStats {
   std::atomic<uint64_t> blit_copy_calls{0};
   std::atomic<uint64_t> blit_copy_bytes{0};
   std::atomic<uint64_t> buffer_contents_calls{0};
+  /// Phase 4 followup: incremented in context_blit_*_views when the
+  /// metal_heap::Staging pool was unavailable or exhausted and we fell
+  /// back to a direct metal::create_buffer for staging. A persistently
+  /// non-zero value here signals the user's staging_capacity_bytes is
+  /// undersized for their workload.
+  std::atomic<uint64_t> staging_fallback_count{0};
 };
 
 /// Process-global stats handle.

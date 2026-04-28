@@ -88,14 +88,20 @@ public:
                      const MetalContextHeapConfig &cfg) {
     metal_heap::HeapConfig hcfg;
     hcfg.transient_lane_count = 0;
-    // Staging pool: cap is a CEILING, not eager reservation. The pool's
-    // bucket buffers are individual MTLBuffers (not heap sub-buffers), so
-    // they don't trigger MTLHeap's first-bind eager-commit pattern;
-    // resident bytes track only what gets acquired from the pool.
-    // 32 MiB is enough for the 4-section optimizer-state checkpoint
-    // round-trip with all power-of-2 buckets resident; smaller workloads
-    // pay only for the buckets they actually touch.
-    hcfg.staging_max_bytes    = 32 * 1024 * 1024;
+    // Staging pool: cap is a CEILING, not eager reservation. Bucket
+    // buffers are individual MTLBuffers (not heap sub-buffers), so they
+    // don't trigger MTLHeap's first-bind eager-commit pattern; resident
+    // bytes track only what gets acquired from the pool.
+    //
+    // 256 MiB sized to hold all four Adam-state sections concurrently
+    // for a default HashGridEncoding (log2_hashmap=19, num_levels=16,
+    // features_per_level=2 ⇒ 64 MiB hash-grid; m_hash + v_hash =
+    // 128 MiB) plus headroom for the MLP buckets. Users on smaller
+    // hash configs can drop this to 32 MiB without loss.
+    constexpr std::size_t kDefaultStagingCap = 256 * 1024 * 1024;
+    hcfg.staging_max_bytes = (cfg.staging_capacity_bytes != 0)
+                                 ? cfg.staging_capacity_bytes
+                                 : kDefaultStagingCap;
 
     const auto derive_total = [&]() -> std::size_t {
       const double ws = static_cast<double>(device_info.recommended_working_set_bytes);
@@ -542,6 +548,28 @@ struct StagingHandle {
   metal_heap::OwnedBuffer heap_owned;  // valid → dtor returns to pool
   void *raw = nullptr;                 // fallback alloc if heap_owned empty
   void *cpu = nullptr;
+
+  StagingHandle() = default;
+  StagingHandle(const StagingHandle &) = delete;
+  StagingHandle &operator=(const StagingHandle &) = delete;
+
+  // Explicit move semantics that mirror OwnedBuffer's: source is zeroed
+  // out so a stale .raw / .cpu can never be mistaken for live state.
+  StagingHandle(StagingHandle &&o) noexcept
+      : heap_owned(std::move(o.heap_owned)), raw(o.raw), cpu(o.cpu) {
+    o.raw = nullptr;
+    o.cpu = nullptr;
+  }
+  StagingHandle &operator=(StagingHandle &&o) noexcept {
+    if (this != &o) {
+      heap_owned = std::move(o.heap_owned);
+      raw = o.raw;
+      cpu = o.cpu;
+      o.raw = nullptr;
+      o.cpu = nullptr;
+    }
+    return *this;
+  }
 };
 
 static StagingHandle acquire_staging(MetalContext &ctx, std::size_t bytes) {
@@ -563,6 +591,11 @@ static StagingHandle acquire_staging(MetalContext &ctx, std::size_t bytes) {
     }
     // Fall through on StagingExhausted / disabled — direct alloc.
   }
+  // Reached only when heap is null OR Heap::Staging returned an error.
+  // Bump the observability counter so a non-zero value flags a need to
+  // raise heap_config.staging_capacity_bytes.
+  metal::alloc_stats().staging_fallback_count.fetch_add(
+      1, std::memory_order_relaxed);
   h.raw = metal::create_buffer(context_raw_device(ctx), bytes,
                                /*shared=*/true);
   if (h.raw) h.cpu = metal::buffer_contents(h.raw);

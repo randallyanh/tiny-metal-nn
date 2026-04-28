@@ -30,6 +30,7 @@ void reset_alloc_stats() {
   s.blit_copy_calls.store(0, std::memory_order_relaxed);
   s.blit_copy_bytes.store(0, std::memory_order_relaxed);
   s.buffer_contents_calls.store(0, std::memory_order_relaxed);
+  s.staging_fallback_count.store(0, std::memory_order_relaxed);
 }
 
 // ---------------------------------------------------------------------------
