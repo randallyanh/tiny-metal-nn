@@ -828,6 +828,49 @@ void run_reset_optimizer_microbench() {
               kIter, med, mn / 1.0e6, mx / 1.0e6);
 }
 
+// Phase 5 microbench: time a single create_trainer call with the
+// default HashGridEncoding (log2_hashmap=19 ⇒ 16M-float hash grid =
+// 64 MiB Adam-state per copy). Pre-Phase-5 this paid ~240 ms of CPU
+// std::mt19937 fill; Phase 5 routes it through the GPU init kernel.
+void run_init_microbench() {
+  auto ctx = MetalContext::create();
+  if (!ctx->is_gpu_available()) {
+    std::printf("tmnn init-microbench: skipped (no GPU)\n");
+    return;
+  }
+  // Force the worst-case CPU-RNG-was-slow configuration: default
+  // HashGridEncoding (log2_hashmap=19, num_levels=16, features=2 ⇒
+  // 16M floats hash grid). Use a small MLP so the timing is dominated
+  // by the hash-grid init.
+  HashGridEncoding::Config enc_cfg;  // defaults: log2_hashmap=19
+  FullyFusedMLP::Config net_cfg;
+  net_cfg.hidden_dim = 32;
+  net_cfg.n_input    = enc_cfg.num_levels * enc_cfg.features_per_level;
+  TrainerConfig train_cfg;
+  train_cfg.batch_size = 256;
+
+  // Warm up: compile PSO + driver caches.
+  { auto warm = create_trainer(enc_cfg, net_cfg, train_cfg, ctx); (void)warm; }
+
+  constexpr int kIter = 5;
+  std::vector<uint64_t> samples;
+  samples.reserve(kIter);
+  for (int i = 0; i < kIter; ++i) {
+    const auto t0 = std::chrono::steady_clock::now();
+    auto trainer = create_trainer(enc_cfg, net_cfg, train_cfg, ctx);
+    const auto t1 = std::chrono::steady_clock::now();
+    samples.push_back(static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
+    (void)trainer;
+  }
+  const double med = median_ns(std::vector(samples)) / 1.0e6;
+  uint64_t mn = samples[0], mx = samples[0];
+  for (auto s : samples) { mn = std::min(mn, s); mx = std::max(mx, s); }
+  std::printf("tmnn init-microbench [HashGrid log2_hashmap=19, %d iter]: "
+              "median=%.3f ms min=%.3f ms max=%.3f ms\n",
+              kIter, med, mn / 1.0e6, mx / 1.0e6);
+}
+
 // Phase 4 followup microbench: timed export_optimizer_state +
 // import_optimizer_state round-trip. Pre-batching this path did 4
 // GPU sync round-trips on export and 4 + 2 (clear_state) on import.
@@ -1110,6 +1153,7 @@ int main(int argc, char **argv) {
   bool heap_commit_probe = false;
   bool reset_optimizer_microbench = false;
   bool checkpoint_microbench = false;
+  bool init_microbench = false;
   bool wired_memory_trace = false;
   bool allocate_microbench = false;
   for (int i = 1; i < argc; ++i) {
@@ -1132,6 +1176,8 @@ int main(int argc, char **argv) {
       reset_optimizer_microbench = true;
     else if (std::string_view(argv[i]) == "--checkpoint-microbench")
       checkpoint_microbench = true;
+    else if (std::string_view(argv[i]) == "--init-microbench")
+      init_microbench = true;
     else if (std::string_view(argv[i]) == "--wired-memory-trace")
       wired_memory_trace = true;
     else if (std::string_view(argv[i]) == "--allocate-microbench")
@@ -1158,6 +1204,10 @@ int main(int argc, char **argv) {
   }
   if (checkpoint_microbench) {
     run_checkpoint_microbench();
+    return 0;
+  }
+  if (init_microbench) {
+    run_init_microbench();
     return 0;
   }
   if (wired_memory_trace) {

@@ -100,18 +100,40 @@ void context_blit_download_views(MetalContext &ctx,
                                  std::span<const BlitDownloadRequest> reqs);
 
 /// Phase 5: GPU-side weight init via a Philox-4x32-10 RNG kernel.
-/// Fills the `dst` view with uniform samples in [low, high]. The kernel
-/// is compiled once per MetalContext and cached by PipelineRegistry. The
-/// counter_base offsets the per-thread counter so distinct call sites
-/// (hash grid vs MLP) draw from non-overlapping streams of the same
-/// seed. Caller must commit and wait downstream — this helper only
-/// encodes onto a freshly-created command buffer and runs it inline.
+/// Fills `dst` with uniform samples in [low, high]. counter_base offsets
+/// the per-thread Philox counter so distinct call sites (hash grid vs
+/// MLP) can draw from non-overlapping streams of the same seed. Encodes
+/// onto a fresh command buffer; commits and (by default) waits inline.
+/// For batching multiple inits into one round-trip use the views
+/// variant below.
 void context_dispatch_init_uniform(MetalContext &ctx,
                                    BufferView dst,
                                    std::size_t element_count,
                                    float low, float high,
                                    std::uint64_t seed,
-                                   std::uint32_t counter_base);
+                                   std::uint32_t counter_base,
+                                   bool wait_for_completion = true);
+
+/// Batched variant: N init dispatches share ONE command buffer + ONE
+/// commit_(and_wait) round-trip. Same shape as context_blit_fill_views.
+/// Pass wait_for_completion = false from internal call sites that don't
+/// need the host to observe the writes immediately — Metal preserves
+/// in-order execution on the queue, so a downstream dispatch on the
+/// same queue naturally serializes after these writes. Tests / debug
+/// readers should pass true (default) so they can inspect cpu_data
+/// directly.
+struct InitUniformRequest {
+  BufferView dst;
+  std::size_t element_count;
+  float low;
+  float high;
+  std::uint64_t seed;
+  std::uint32_t counter_base;
+};
+void context_dispatch_init_uniform_views(
+    MetalContext &ctx,
+    std::span<const InitUniformRequest> reqs,
+    bool wait_for_completion = true);
 
 /// Upload host bytes into a GPU-only buffer view via a staging blit.
 void context_blit_upload(MetalContext &ctx, BufferView &dst, const void *data,

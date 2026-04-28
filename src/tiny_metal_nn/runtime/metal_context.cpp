@@ -22,6 +22,7 @@
 #include "tiny_metal_nn/runtime/runtime_policy.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -795,74 +796,121 @@ constexpr std::uint64_t kInitUniformPipelineHash = 0xC0FFEE5070A0501ull;
 
 }  // namespace
 
-void context_dispatch_init_uniform(MetalContext &ctx,
-                                   BufferView dst,
-                                   std::size_t element_count,
-                                   float low, float high,
-                                   std::uint64_t seed,
-                                   std::uint32_t counter_base) {
-  if (!ctx.is_gpu_available() || !dst.gpu_buffer || element_count == 0) return;
+// Per-dispatch params layout matching the MSL `InitParams` struct.
+struct InitParamsLayout {
+  std::uint32_t key0;
+  std::uint32_t key1;
+  std::uint32_t counter_base;
+  std::uint32_t element_count;
+  float low;
+  float high;
+};
 
+// Resolve the cached init pipeline (compiles on first request per context).
+static void *resolve_init_pipeline(MetalContext &ctx) {
   auto &reg = MetalContextAccessor::registry(ctx);
   PipelineKey pkey{kInitUniformPipelineHash, "init_uniform_philox",
                    /*precise_math=*/false, /*binding_count=*/2,
                    /*threadgroup_memory_bytes=*/0};
   auto pso = reg.register_pipeline(pkey, kInitUniformPhiloxMSL,
                                    "init_uniform_philox");
-  void *raw_pso = reg.raw_pipeline(pso);
-  if (!raw_pso) {
+  return reg.raw_pipeline(pso);
+}
+
+void context_dispatch_init_uniform_views(
+    MetalContext &ctx, std::span<const InitUniformRequest> reqs,
+    bool wait_for_completion) {
+  if (!ctx.is_gpu_available() || reqs.empty()) return;
+
+  void *pso = resolve_init_pipeline(ctx);
+  if (!pso) {
     throw std::runtime_error(
-        "context_dispatch_init_uniform: failed to compile init kernel");
+        "context_dispatch_init_uniform_views: failed to compile init kernel");
   }
 
-  // Per-call params are tiny (24 bytes) — push them through a small
-  // Shared MTLBuffer instead of setBytes so we keep one dispatch path.
-  struct InitParams {
-    std::uint32_t key0;
-    std::uint32_t key1;
-    std::uint32_t counter_base;
-    std::uint32_t element_count;
-    float low;
-    float high;
+  // Allocate ONE param buffer holding N InitParams entries side-by-side,
+  // and bind sub-ranges per dispatch via the bind offset. Saves N
+  // metal::create_buffer calls.
+  struct PerReq {
+    const InitUniformRequest *req;
+    std::uint32_t param_offset;
+    std::uint32_t threads;
   };
-  InitParams params{
-      static_cast<std::uint32_t>(seed & 0xFFFFFFFFu),
-      static_cast<std::uint32_t>((seed >> 32) & 0xFFFFFFFFu),
-      counter_base,
-      static_cast<std::uint32_t>(element_count),
-      low, high,
-  };
+  std::vector<PerReq> active;
+  active.reserve(reqs.size());
+  for (const auto &r : reqs) {
+    if (!r.dst.gpu_buffer || r.element_count == 0) continue;
+    active.push_back(
+        {&r,
+         static_cast<std::uint32_t>(active.size() * sizeof(InitParamsLayout)),
+         static_cast<std::uint32_t>((r.element_count + 3u) / 4u)});
+  }
+  if (active.empty()) return;
+
+  const std::size_t param_buf_bytes = active.size() * sizeof(InitParamsLayout);
   void *param_buf = metal::create_buffer(context_raw_device(ctx),
-                                         sizeof(params), /*shared=*/true);
+                                         param_buf_bytes, /*shared=*/true);
   if (!param_buf) {
     throw std::runtime_error(
-        "context_dispatch_init_uniform: param staging alloc failed");
+        "context_dispatch_init_uniform_views: param staging alloc failed");
   }
-  std::memcpy(metal::buffer_contents(param_buf), &params, sizeof(params));
+  auto *param_data = static_cast<InitParamsLayout *>(
+      metal::buffer_contents(param_buf));
+  for (std::size_t i = 0; i < active.size(); ++i) {
+    const auto &r = *active[i].req;
+    param_data[i] = {
+        static_cast<std::uint32_t>(r.seed & 0xFFFFFFFFu),
+        static_cast<std::uint32_t>((r.seed >> 32) & 0xFFFFFFFFu),
+        r.counter_base,
+        static_cast<std::uint32_t>(r.element_count),
+        r.low, r.high,
+    };
+  }
 
-  // Each thread emits 4 floats; round up the grid to cover the tail.
-  const std::uint32_t threads = static_cast<std::uint32_t>(
-      (element_count + 3u) / 4u);
-  // 256 threads/threadgroup is a safe SIMD-aligned default on Apple GPUs;
-  // dispatch_threads handles non-multiple-of-tg sizing internally via
-  // metal::encode_dispatch's clamp.
-  const std::uint32_t tg = 256u;
-
+  constexpr std::uint32_t kTgSize = 256u;
   auto *cmd = metal::create_command_buffer(context_raw_queue(ctx));
-  metal::DispatchDesc::BufferBind binds[2] = {
-      {dst.gpu_buffer, static_cast<std::uint32_t>(dst.offset), 0u},
-      {param_buf, 0u, 1u},
-  };
-  metal::DispatchDesc dd{
-      cmd, raw_pso, binds, /*binding_count=*/2u,
-      threads, 1u, 1u,
-      tg,      1u, 1u,
-      0u,
-  };
-  metal::encode_dispatch(dd);
-  metal::commit_and_wait(cmd);
+  for (const auto &p : active) {
+    metal::DispatchDesc::BufferBind binds[2] = {
+        {p.req->dst.gpu_buffer,
+         static_cast<std::uint32_t>(p.req->dst.offset), 0u},
+        {param_buf, p.param_offset, 1u},
+    };
+    metal::DispatchDesc dd{
+        cmd, pso, binds, /*binding_count=*/2u,
+        p.threads, 1u, 1u,
+        kTgSize,   1u, 1u,
+        0u,
+    };
+    metal::encode_dispatch(dd);
+  }
+  // wait_for_completion = false uses commit_async; Metal preserves
+  // in-order execution on the command queue, so any downstream dispatch
+  // reading the same buffers naturally observes these writes without a
+  // host sync. The command buffer retains the bound MTLBuffers
+  // internally until completion; our release_* just drops the host's
+  // +1. Async commit avoids serializing the host on init even when the
+  // GPU queue is busy with concurrent work (e.g. another process's
+  // training).
+  if (wait_for_completion) {
+    metal::commit_and_wait(cmd);
+  } else {
+    metal::commit_async(cmd);
+  }
   metal::release_command_buffer(cmd);
   metal::release_buffer(param_buf);
+}
+
+void context_dispatch_init_uniform(MetalContext &ctx,
+                                   BufferView dst,
+                                   std::size_t element_count,
+                                   float low, float high,
+                                   std::uint64_t seed,
+                                   std::uint32_t counter_base,
+                                   bool wait_for_completion) {
+  InitUniformRequest req{dst, element_count, low, high, seed, counter_base};
+  context_dispatch_init_uniform_views(
+      ctx, std::span<const InitUniformRequest>(&req, 1),
+      wait_for_completion);
 }
 
 } // namespace detail
