@@ -297,6 +297,22 @@ void encode_blit_fill(void *cmd_buf, void *buffer, size_t offset,
   [enc endEncoding];
 }
 
+void encode_blit_fill_ranges(void *cmd_buf, const BlitFillRange *ranges,
+                             size_t count, uint8_t value) {
+  if (!cmd_buf || !ranges || count == 0) return;
+  id<MTLCommandBuffer> cb = TO_CMDBUF(cmd_buf);
+  // One encoder for N fills — driver pays one encoder-allocate +
+  // endEncoding cycle instead of N.
+  id<MTLBlitCommandEncoder> enc = [cb blitCommandEncoder];
+  for (size_t i = 0; i < count; ++i) {
+    if (!ranges[i].buffer || ranges[i].length == 0) continue;
+    [enc fillBuffer:TO_BUFFER(ranges[i].buffer)
+              range:NSMakeRange(ranges[i].offset, ranges[i].length)
+              value:value];
+  }
+  [enc endEncoding];
+}
+
 void encode_blit_copy(void *cmd_buf, void *src_buffer, size_t src_offset,
                       void *dst_buffer, size_t dst_offset, size_t length) {
   if (!cmd_buf || !src_buffer || !dst_buffer || length == 0)

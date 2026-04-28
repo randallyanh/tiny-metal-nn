@@ -141,6 +141,17 @@ void encode_dispatch(const DispatchDesc &desc);
 void encode_blit_fill(void *cmd_buf, void *buffer, size_t offset,
                       size_t length, uint8_t value);
 
+/// Phase 4: encode N fillBuffer ops on a SINGLE MTLBlitCommandEncoder.
+/// Same byte value across all ranges. Skips entries with null buffer or
+/// zero length. No-op if count == 0.
+struct BlitFillRange {
+  void *buffer;     ///< id<MTLBuffer>
+  size_t offset;
+  size_t length;
+};
+void encode_blit_fill_ranges(void *cmd_buf, const BlitFillRange *ranges,
+                             size_t count, uint8_t value);
+
 /// Encode a blit buffer copy on a command buffer.
 void encode_blit_copy(void *cmd_buf, void *src_buffer, size_t src_offset,
                       void *dst_buffer, size_t dst_offset, size_t length);

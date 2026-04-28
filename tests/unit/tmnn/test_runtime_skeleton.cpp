@@ -17,6 +17,8 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <cstring>
+#include <span>
 #include <string>
 
 using namespace tmnn;
@@ -273,6 +275,59 @@ TEST(RuntimeSkeleton, SnapshotStatsEmitsTelemetryWhenEnabled) {
 // --- GPU availability ---
 
 // --- GPU dispatch tests (GTEST_SKIP on non-Apple) ---
+
+// Phase 4: batched blit-fill. Allocates three Shared buffers, writes
+// known content, fires one batched fill at value=0, and verifies all
+// three are zeroed. Helper does NOT skip Shared internally — that's the
+// caller's pre-filter responsibility — so this test pins the general
+// fill-N-buffers-with-one-commit_and_wait contract.
+TEST(RuntimeSkeleton, BlitFillViewsBatchesMultipleBuffers) {
+  auto ctx = MetalContext::create();
+  if (!ctx->is_gpu_available())
+    GTEST_SKIP() << "No GPU";
+  auto &arena = detail::context_arena(*ctx);
+
+  auto h0 = arena.allocate(
+      {256, 256, BufferStorage::Shared, BufferLifetime::Persistent, "fv0"});
+  auto h1 = arena.allocate(
+      {512, 256, BufferStorage::Shared, BufferLifetime::Persistent, "fv1"});
+  auto h2 = arena.allocate(
+      {128, 256, BufferStorage::Shared, BufferLifetime::Persistent, "fv2"});
+
+  auto v0 = arena.view(h0);
+  auto v1 = arena.view(h1);
+  auto v2 = arena.view(h2);
+
+  // Stamp known non-zero content via CPU.
+  std::memset(v0.data, 0xAB, v0.bytes);
+  std::memset(v1.data, 0xCD, v1.bytes);
+  std::memset(v2.data, 0xEF, v2.bytes);
+
+  const BufferView views[] = {v0, v1, v2};
+  detail::context_blit_fill_views(*ctx, std::span<const BufferView>(views),
+                                  0);
+
+  for (size_t i = 0; i < v0.bytes; ++i)
+    ASSERT_EQ(static_cast<const uint8_t *>(v0.data)[i], 0u);
+  for (size_t i = 0; i < v1.bytes; ++i)
+    ASSERT_EQ(static_cast<const uint8_t *>(v1.data)[i], 0u);
+  for (size_t i = 0; i < v2.bytes; ++i)
+    ASSERT_EQ(static_cast<const uint8_t *>(v2.data)[i], 0u);
+}
+
+// Empty-batch fast-path: no work, no command buffer created, no commit.
+// Verified indirectly by "doesn't hang and returns" — under contention
+// an erroneous commit_and_wait on an empty cmdbuf could stall.
+TEST(RuntimeSkeleton, BlitFillViewsEmptyBatchIsNoOp) {
+  auto ctx = MetalContext::create();
+  if (!ctx->is_gpu_available())
+    GTEST_SKIP() << "No GPU";
+  detail::context_blit_fill_views(*ctx, std::span<const BufferView>(), 0);
+  // All views with no gpu_buffer are also a no-op.
+  BufferView empties[2] = {};
+  detail::context_blit_fill_views(*ctx,
+                                  std::span<const BufferView>(empties), 0);
+}
 
 TEST(RuntimeSkeleton, BlitFillEndToEnd) {
   auto ctx = MetalContext::create();

@@ -790,6 +790,44 @@ void run_heap_commit_probe() {
   }
 }
 
+// Phase 4 microbench: tightly measures the cost of one reset_optimizer
+// call, which on the default trainer fires the same six-buffer Adam-zero
+// pattern as init_parameter_store. Pre-Phase-4 each call did six
+// commit_and_wait round-trips; post-Phase-4 it does one batched blit-fill.
+// 100 iterations, median reported, single trainer, single MetalContext —
+// strips out cold-load and PSO-compile noise that contaminates
+// --cold-start-attribution under shared-server load.
+void run_reset_optimizer_microbench() {
+  auto ctx = MetalContext::create();
+  if (!ctx->is_gpu_available()) {
+    std::printf("tmnn reset-optimizer-microbench: skipped (no GPU)\n");
+    return;
+  }
+  const auto enc_cfg = default_trainer_encoding_config();
+  const auto net_cfg = default_trainer_network_config(enc_cfg);
+  const auto train_cfg = default_trainer_config();
+  auto trainer = create_trainer(enc_cfg, net_cfg, train_cfg, ctx);
+  // Warm up: first call may pay PSO / driver fast-path cold cost.
+  trainer.reset_optimizer();
+
+  constexpr int kIter = 100;
+  std::vector<uint64_t> samples;
+  samples.reserve(kIter);
+  for (int i = 0; i < kIter; ++i) {
+    const auto t0 = std::chrono::steady_clock::now();
+    trainer.reset_optimizer();
+    const auto t1 = std::chrono::steady_clock::now();
+    samples.push_back(static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
+  }
+  const auto med = median_ns(std::vector(samples)) / 1.0e6;
+  uint64_t mn = samples[0], mx = samples[0];
+  for (auto s : samples) { mn = std::min(mn, s); mx = std::max(mx, s); }
+  std::printf("tmnn reset-optimizer-microbench [default-path, %d iter]: "
+              "median=%.3f ms min=%.3f ms max=%.3f ms\n",
+              kIter, med, mn / 1.0e6, mx / 1.0e6);
+}
+
 // G4: wired-memory snapshot — phys_footprint before/after constructing a
 // trainer and after destroying it. Persistent reservation + per-step
 // transient capacity dominate the resident delta. Honors
@@ -1025,6 +1063,7 @@ int main(int argc, char **argv) {
   bool cold_start_trace = false;
   bool cold_start_attribution = false;
   bool heap_commit_probe = false;
+  bool reset_optimizer_microbench = false;
   bool wired_memory_trace = false;
   bool allocate_microbench = false;
   for (int i = 1; i < argc; ++i) {
@@ -1043,6 +1082,8 @@ int main(int argc, char **argv) {
       cold_start_attribution = true;
     else if (std::string_view(argv[i]) == "--heap-commit-probe")
       heap_commit_probe = true;
+    else if (std::string_view(argv[i]) == "--reset-optimizer-microbench")
+      reset_optimizer_microbench = true;
     else if (std::string_view(argv[i]) == "--wired-memory-trace")
       wired_memory_trace = true;
     else if (std::string_view(argv[i]) == "--allocate-microbench")
@@ -1061,6 +1102,10 @@ int main(int argc, char **argv) {
   }
   if (heap_commit_probe) {
     run_heap_commit_probe();
+    return 0;
+  }
+  if (reset_optimizer_microbench) {
+    run_reset_optimizer_microbench();
     return 0;
   }
   if (wired_memory_trace) {

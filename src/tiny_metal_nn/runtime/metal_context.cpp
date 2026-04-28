@@ -28,6 +28,7 @@
 #include <span>
 #include <stdexcept>
 #include <unordered_map>
+#include <vector>
 
 namespace tmnn {
 
@@ -436,20 +437,20 @@ void context_blit_fill_views(MetalContext &ctx,
                              std::span<const BufferView> views,
                              uint8_t value) {
   if (!ctx.is_gpu_available()) return;
-  // Skip zero-cost: we want exactly one cmdbuf to cover the whole batch,
-  // but if no view actually has GPU bytes to fill, don't pay for an empty
-  // commit_and_wait round-trip.
-  bool has_work = false;
+  // Project to the metal_device::BlitFillRange shape and skip empty
+  // entries — keeps the GPU-side encoder loop branchless and lets us
+  // bail before allocating a command buffer when nothing has work.
+  std::vector<metal::BlitFillRange> ranges;
+  ranges.reserve(views.size());
   for (const auto &v : views) {
-    if (v.gpu_buffer && v.bytes > 0) { has_work = true; break; }
+    if (v.gpu_buffer && v.bytes > 0) {
+      ranges.push_back({v.gpu_buffer, v.offset, v.bytes});
+    }
   }
-  if (!has_work) return;
+  if (ranges.empty()) return;
 
   auto *cmd = metal::create_command_buffer(context_raw_queue(ctx));
-  for (const auto &v : views) {
-    if (!v.gpu_buffer || v.bytes == 0) continue;
-    metal::encode_blit_fill(cmd, v.gpu_buffer, v.offset, v.bytes, value);
-  }
+  metal::encode_blit_fill_ranges(cmd, ranges.data(), ranges.size(), value);
   metal::commit_and_wait(cmd);
   metal::release_command_buffer(cmd);
 }
