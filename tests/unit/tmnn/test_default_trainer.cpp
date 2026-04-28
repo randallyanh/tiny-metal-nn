@@ -1011,6 +1011,48 @@ TEST(DefaultTrainer, SetInitialWeightsRoundTrips) {
   }
 }
 
+// Phase 5.3 integration smoke: wire KaimingNormal through
+// TrainerConfig.weight_init end-to-end and verify the trainer
+// constructs + evaluates + trains without producing NaN/Inf. The
+// Box-Muller kernel itself is pinned by
+// RuntimeSkeleton.InitNormalPhiloxKernelProducesNormal; this test
+// closes the loop from public API → kernel.
+TEST(DefaultTrainer, KaimingNormalInitProducesFiniteOutputs) {
+  auto ctx = MetalContext::create();
+  if (!ctx->is_gpu_available())
+    GTEST_SKIP() << "No GPU";
+  HashGridEncoding::Config enc_cfg;
+  enc_cfg.log2_hashmap_size = 14;
+  TrainerConfig train_cfg{.batch_size = 256};
+  train_cfg.weight_init.mlp_mode = MlpInit::KaimingNormal;
+  train_cfg.weight_init.seed = 0x5EEDull;
+
+  auto enc = create_encoding(enc_cfg);
+  auto net = create_network(small_net());
+  auto model = create_network_with_input_encoding(enc, net);
+  auto trainer = create_trainer(model, train_cfg, ctx);
+
+  std::vector<float> positions, targets;
+  make_sphere_batch(static_cast<int>(trainer.batch_plan().max_batch_size),
+                    static_cast<int>(trainer.batch_plan().input_dims),
+                    positions, targets);
+
+  // Pre-step evaluate must produce finite outputs (Box-Muller +
+  // Kaiming stddev should give bounded weight magnitudes).
+  std::vector<float> out_pre(trainer.batch_plan().max_batch_size);
+  ASSERT_TRUE(trainer.evaluate(positions.data(), out_pre.data(),
+                               trainer.batch_plan().max_batch_size));
+  for (uint32_t i = 0; i < trainer.batch_plan().max_batch_size; ++i) {
+    ASSERT_TRUE(std::isfinite(out_pre[i]))
+        << "non-finite pre-step output at i=" << i;
+  }
+
+  // One training step also stays finite.
+  auto step = trainer.training_step(positions.data(), targets.data(),
+                                    trainer.batch_plan().max_batch_size);
+  ASSERT_TRUE(std::isfinite(step.loss));
+}
+
 // Size mismatch must throw — caller bug surfaced loudly rather than
 // silently truncating.
 TEST(DefaultTrainer, SetInitialWeightsRejectsSizeMismatch) {

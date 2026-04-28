@@ -1578,8 +1578,12 @@ struct DefaultRuntime final : ITrainerRuntime, InspectableTrainerRuntime {
     }
 
     // Shared paths go through CPU memcpy (view.data is the host pointer
-    // into the same MTLBuffer the GPU sees). Private paths batch into
-    // ONE blit_upload_views round-trip.
+    // into the same MTLBuffer the GPU sees). The Private branch below is
+    // structurally unreachable today — ParameterStore allocates
+    // fused_weights as BufferStorage::Shared regardless of
+    // use_private_buffers (only the Adam moments follow that flag). Kept
+    // as defensive future-proofing in case fused_weights ever migrates
+    // to Private, e.g. if a per-layer aliasing redesign lands.
     std::vector<detail::BlitUploadRequest> uploads;
     uploads.reserve(2);
     if (hash_weights != nullptr && hash_count > 0) {
