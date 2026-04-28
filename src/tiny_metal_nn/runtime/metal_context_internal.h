@@ -99,6 +99,20 @@ struct BlitDownloadRequest {
 void context_blit_download_views(MetalContext &ctx,
                                  std::span<const BlitDownloadRequest> reqs);
 
+/// Phase 5: GPU-side weight init via a Philox-4x32-10 RNG kernel.
+/// Fills the `dst` view with uniform samples in [low, high]. The kernel
+/// is compiled once per MetalContext and cached by PipelineRegistry. The
+/// counter_base offsets the per-thread counter so distinct call sites
+/// (hash grid vs MLP) draw from non-overlapping streams of the same
+/// seed. Caller must commit and wait downstream — this helper only
+/// encodes onto a freshly-created command buffer and runs it inline.
+void context_dispatch_init_uniform(MetalContext &ctx,
+                                   BufferView dst,
+                                   std::size_t element_count,
+                                   float low, float high,
+                                   std::uint64_t seed,
+                                   std::uint32_t counter_base);
+
 /// Upload host bytes into a GPU-only buffer view via a staging blit.
 void context_blit_upload(MetalContext &ctx, BufferView &dst, const void *data,
                          size_t bytes);

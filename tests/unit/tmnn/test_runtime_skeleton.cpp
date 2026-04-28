@@ -338,6 +338,88 @@ TEST(RuntimeSkeleton, BlitFillViewsEmptyBatchIsNoOp) {
                                   std::span<const BufferView>(empties), 0);
 }
 
+// Phase 5: Philox init kernel correctness.
+//   * All samples land within [low, high].
+//   * Same seed reproduces the exact same byte sequence.
+//   * Different seeds produce different sequences.
+//   * Sample mean/variance roughly match a uniform distribution
+//     (loose bounds; we're not running statistical tests, just sanity).
+TEST(RuntimeSkeleton, InitUniformPhiloxKernelProducesUniform) {
+  auto ctx = MetalContext::create();
+  if (!ctx->is_gpu_available())
+    GTEST_SKIP() << "No GPU";
+  auto &arena = detail::context_arena(*ctx);
+
+  constexpr size_t kN = 65536;  // 256 KiB Shared buffer
+  auto h = arena.allocate({kN * sizeof(float), 256, BufferStorage::Shared,
+                           BufferLifetime::Persistent, "init_test"});
+  auto v = arena.view(h);
+
+  detail::context_dispatch_init_uniform(*ctx, v, kN, /*low=*/-0.5f,
+                                        /*high=*/0.5f, /*seed=*/123u,
+                                        /*counter_base=*/0u);
+  const auto *out = static_cast<const float *>(v.data);
+  double sum = 0.0, sq = 0.0;
+  for (size_t i = 0; i < kN; ++i) {
+    ASSERT_GE(out[i], -0.5f);
+    ASSERT_LE(out[i], 0.5f);
+    sum += out[i];
+    sq += static_cast<double>(out[i]) * out[i];
+  }
+  const double mean = sum / kN;
+  const double var = sq / kN - mean * mean;
+  // Uniform[-0.5, 0.5]: theoretical mean=0, variance=1/12≈0.0833.
+  EXPECT_NEAR(mean, 0.0, 0.01);
+  EXPECT_NEAR(var, 1.0 / 12.0, 0.005);
+
+  // Reproducibility: fresh dispatch with same seed produces identical bytes.
+  std::vector<float> snapshot(out, out + kN);
+  detail::context_dispatch_init_uniform(*ctx, v, kN, -0.5f, 0.5f, 123u, 0u);
+  for (size_t i = 0; i < kN; ++i) {
+    ASSERT_EQ(out[i], snapshot[i]) << "i=" << i;
+  }
+
+  // Different seed → different sequence (sample first 4 floats; vanishingly
+  // small chance of collision under Philox).
+  detail::context_dispatch_init_uniform(*ctx, v, kN, -0.5f, 0.5f,
+                                        /*seed=*/124u, 0u);
+  bool any_diff = false;
+  for (size_t i = 0; i < 4; ++i) {
+    if (out[i] != snapshot[i]) { any_diff = true; break; }
+  }
+  EXPECT_TRUE(any_diff);
+}
+
+// counter_base offsets the per-thread Philox counter so two call sites
+// (e.g. hash grid + MLP) can draw from non-overlapping streams of the
+// same seed without correlation.
+TEST(RuntimeSkeleton, InitUniformPhiloxCounterBaseShiftsStream) {
+  auto ctx = MetalContext::create();
+  if (!ctx->is_gpu_available())
+    GTEST_SKIP() << "No GPU";
+  auto &arena = detail::context_arena(*ctx);
+
+  constexpr size_t kN = 1024;
+  auto h = arena.allocate({kN * sizeof(float), 256, BufferStorage::Shared,
+                           BufferLifetime::Persistent, "init_offset"});
+  auto v = arena.view(h);
+
+  detail::context_dispatch_init_uniform(*ctx, v, kN, -0.5f, 0.5f, 7u, 0u);
+  std::vector<float> base(static_cast<const float *>(v.data),
+                          static_cast<const float *>(v.data) + kN);
+
+  detail::context_dispatch_init_uniform(*ctx, v, kN, -0.5f, 0.5f, 7u,
+                                        /*counter_base=*/1024u);
+  // Same seed, shifted counter → completely different stream.
+  size_t equal_count = 0;
+  for (size_t i = 0; i < kN; ++i) {
+    if (static_cast<const float *>(v.data)[i] == base[i]) ++equal_count;
+  }
+  EXPECT_LT(equal_count, kN / 64u)
+      << "counter_base offset should produce a near-uncorrelated stream; "
+         "saw " << equal_count << " / " << kN << " collisions";
+}
+
 TEST(RuntimeSkeleton, BlitFillEndToEnd) {
   auto ctx = MetalContext::create();
   if (!ctx->is_gpu_available())

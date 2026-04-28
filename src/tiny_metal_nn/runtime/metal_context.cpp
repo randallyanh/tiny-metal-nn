@@ -715,6 +715,155 @@ void context_blit_download_views(MetalContext &ctx,
   release_all();
 }
 
-} // namespace detail
+// ---------------------------------------------------------------------------
+// Phase 5: GPU weight init via Philox-4x32-10
+// ---------------------------------------------------------------------------
 
+namespace {
+
+// Counter-based RNG. Each thread emits 4 floats from its own (counter,
+// key) seed — no shared state, no synchronization. Output mapped affinely
+// to [low, high]. Reproducible across runs given the same seed.
+//
+// Reference: Salmon et al., "Parallel Random Numbers: As Easy as 1, 2, 3"
+// (SC'11). Constants match cuRAND / tinycudann's Philox-4x32-10.
+constexpr const char *kInitUniformPhiloxMSL = R"MSL(
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint32_t PHILOX_M0 = 0xD2511F53u;
+constant uint32_t PHILOX_M1 = 0xCD9E8D57u;
+constant uint32_t PHILOX_W0 = 0x9E3779B9u;
+constant uint32_t PHILOX_W1 = 0xBB67AE85u;
+
+inline uint4 philox_round(uint4 ctr, uint2 key) {
+  uint64_t p0 = (uint64_t)PHILOX_M0 * (uint64_t)ctr.x;
+  uint64_t p1 = (uint64_t)PHILOX_M1 * (uint64_t)ctr.z;
+  uint32_t hi0 = uint32_t(p0 >> 32), lo0 = uint32_t(p0);
+  uint32_t hi1 = uint32_t(p1 >> 32), lo1 = uint32_t(p1);
+  return uint4(hi1 ^ ctr.y ^ key.x, lo1, hi0 ^ ctr.w ^ key.y, lo0);
+}
+
+inline uint4 philox_4x32_10(uint4 ctr, uint2 key) {
+  for (int i = 0; i < 10; ++i) {
+    ctr = philox_round(ctr, key);
+    key = uint2(key.x + PHILOX_W0, key.y + PHILOX_W1);
+  }
+  return ctr;
+}
+
+struct InitParams {
+  uint32_t key0;
+  uint32_t key1;
+  uint32_t counter_base;
+  uint32_t element_count;
+  float low;
+  float high;
+};
+
+kernel void init_uniform_philox(
+    device float *out [[buffer(0)]],
+    constant InitParams &p [[buffer(1)]],
+    uint tid [[thread_position_in_grid]])
+{
+  uint4 ctr = uint4(p.counter_base + tid, 0u, 0u, 0u);
+  uint2 key = uint2(p.key0, p.key1);
+  uint4 r = philox_4x32_10(ctr, key);
+
+  // u32 -> [0, 1) via 2^-32 scale, then affine to [low, high].
+  const float kScale = 1.0f / 4294967296.0f;
+  float4 u = float4(r) * kScale;
+  float4 v = float4(p.low) + u * float4(p.high - p.low);
+
+  uint base = tid * 4u;
+  if (base + 4u <= p.element_count) {
+    out[base + 0u] = v.x;
+    out[base + 1u] = v.y;
+    out[base + 2u] = v.z;
+    out[base + 3u] = v.w;
+  } else {
+    if (base + 0u < p.element_count) out[base + 0u] = v.x;
+    if (base + 1u < p.element_count) out[base + 1u] = v.y;
+    if (base + 2u < p.element_count) out[base + 2u] = v.z;
+  }
+}
+)MSL";
+
+// Distinguishable PipelineKey for the init kernel. Hash chosen so it
+// won't collide with the KernelCompiler's training-kernel hashes.
+constexpr std::uint64_t kInitUniformPipelineHash = 0xC0FFEE5070A0501ull;
+
+}  // namespace
+
+void context_dispatch_init_uniform(MetalContext &ctx,
+                                   BufferView dst,
+                                   std::size_t element_count,
+                                   float low, float high,
+                                   std::uint64_t seed,
+                                   std::uint32_t counter_base) {
+  if (!ctx.is_gpu_available() || !dst.gpu_buffer || element_count == 0) return;
+
+  auto &reg = MetalContextAccessor::registry(ctx);
+  PipelineKey pkey{kInitUniformPipelineHash, "init_uniform_philox",
+                   /*precise_math=*/false, /*binding_count=*/2,
+                   /*threadgroup_memory_bytes=*/0};
+  auto pso = reg.register_pipeline(pkey, kInitUniformPhiloxMSL,
+                                   "init_uniform_philox");
+  void *raw_pso = reg.raw_pipeline(pso);
+  if (!raw_pso) {
+    throw std::runtime_error(
+        "context_dispatch_init_uniform: failed to compile init kernel");
+  }
+
+  // Per-call params are tiny (24 bytes) — push them through a small
+  // Shared MTLBuffer instead of setBytes so we keep one dispatch path.
+  struct InitParams {
+    std::uint32_t key0;
+    std::uint32_t key1;
+    std::uint32_t counter_base;
+    std::uint32_t element_count;
+    float low;
+    float high;
+  };
+  InitParams params{
+      static_cast<std::uint32_t>(seed & 0xFFFFFFFFu),
+      static_cast<std::uint32_t>((seed >> 32) & 0xFFFFFFFFu),
+      counter_base,
+      static_cast<std::uint32_t>(element_count),
+      low, high,
+  };
+  void *param_buf = metal::create_buffer(context_raw_device(ctx),
+                                         sizeof(params), /*shared=*/true);
+  if (!param_buf) {
+    throw std::runtime_error(
+        "context_dispatch_init_uniform: param staging alloc failed");
+  }
+  std::memcpy(metal::buffer_contents(param_buf), &params, sizeof(params));
+
+  // Each thread emits 4 floats; round up the grid to cover the tail.
+  const std::uint32_t threads = static_cast<std::uint32_t>(
+      (element_count + 3u) / 4u);
+  // 256 threads/threadgroup is a safe SIMD-aligned default on Apple GPUs;
+  // dispatch_threads handles non-multiple-of-tg sizing internally via
+  // metal::encode_dispatch's clamp.
+  const std::uint32_t tg = 256u;
+
+  auto *cmd = metal::create_command_buffer(context_raw_queue(ctx));
+  metal::DispatchDesc::BufferBind binds[2] = {
+      {dst.gpu_buffer, static_cast<std::uint32_t>(dst.offset), 0u},
+      {param_buf, 0u, 1u},
+  };
+  metal::DispatchDesc dd{
+      cmd, raw_pso, binds, /*binding_count=*/2u,
+      threads, 1u, 1u,
+      tg,      1u, 1u,
+      0u,
+  };
+  metal::encode_dispatch(dd);
+  metal::commit_and_wait(cmd);
+  metal::release_command_buffer(cmd);
+  metal::release_buffer(param_buf);
+}
+
+} // namespace detail
 } // namespace tmnn
