@@ -524,101 +524,107 @@ void context_blit_download(MetalContext &ctx, const BufferView &src, void *out,
 
 // Per-request staging allocation. Could later route through metal_heap::
 // Staging for free-list reuse; for now matches the legacy single-call
-// helper's create-and-release pattern. The win here is collapsing N
-// commit_and_wait into one, not the staging-buffer churn.
+// helper's create-and-release pattern. The win is collapsing N
+// commit_and_wait round-trips into one, not the staging-buffer churn.
+//
+// Implementation: filter into a `Pending` vector that pairs each accepted
+// request with its staging — eliminates the indices-in-lockstep fragility
+// of running two predicate-filtered loops.
 void context_blit_upload_views(MetalContext &ctx,
                                std::span<const BlitUploadRequest> reqs) {
   if (!ctx.is_gpu_available() || reqs.empty()) return;
 
-  struct StagingEntry { void *staging; size_t copy_bytes; };
-  std::vector<StagingEntry> stagings;
-  stagings.reserve(reqs.size());
-  // Allocate + memcpy into staging for every request first, so the
-  // command buffer encodes a flat list of blit-copies with no host work
-  // interleaved.
+  struct Pending {
+    const BlitUploadRequest *req;
+    void *staging;
+    std::size_t copy_bytes;
+  };
+  std::vector<Pending> pending;
+  pending.reserve(reqs.size());
+  const auto release_all = [&]() {
+    for (auto &p : pending) metal::release_buffer(p.staging);
+  };
+
   for (const auto &r : reqs) {
     if (r.bytes == 0 || !r.dst.gpu_buffer || !r.src_data) continue;
-    const size_t copy_bytes = std::min(r.bytes, r.dst.bytes);
+    const std::size_t copy_bytes = std::min(r.bytes, r.dst.bytes);
     void *staging = metal::create_buffer(context_raw_device(ctx), copy_bytes,
                                          /*shared=*/true);
     if (!staging) {
-      for (auto &e : stagings) metal::release_buffer(e.staging);
+      release_all();
       throw std::runtime_error(
           "context_blit_upload_views: staging allocation failed");
     }
     void *staging_data = metal::buffer_contents(staging);
     if (!staging_data) {
       metal::release_buffer(staging);
-      for (auto &e : stagings) metal::release_buffer(e.staging);
+      release_all();
       throw std::runtime_error(
           "context_blit_upload_views: staging is not CPU-visible");
     }
     std::memcpy(staging_data, r.src_data, copy_bytes);
-    stagings.push_back({staging, copy_bytes});
+    pending.push_back({&r, staging, copy_bytes});
   }
-  if (stagings.empty()) return;
+  if (pending.empty()) return;
 
   auto *cmd = metal::create_command_buffer(context_raw_queue(ctx));
-  size_t s = 0;
-  for (const auto &r : reqs) {
-    if (r.bytes == 0 || !r.dst.gpu_buffer || !r.src_data) continue;
-    metal::encode_blit_copy(cmd, stagings[s].staging, 0,
-                            r.dst.gpu_buffer, r.dst.offset,
-                            stagings[s].copy_bytes);
-    ++s;
+  for (const auto &p : pending) {
+    metal::encode_blit_copy(cmd, p.staging, 0,
+                            p.req->dst.gpu_buffer, p.req->dst.offset,
+                            p.copy_bytes);
   }
   metal::commit_and_wait(cmd);
   metal::release_command_buffer(cmd);
-  for (auto &e : stagings) metal::release_buffer(e.staging);
+  release_all();
 }
 
 void context_blit_download_views(MetalContext &ctx,
                                  std::span<const BlitDownloadRequest> reqs) {
   if (!ctx.is_gpu_available() || reqs.empty()) return;
 
-  struct StagingEntry { void *staging; size_t copy_bytes; };
-  std::vector<StagingEntry> stagings;
-  stagings.reserve(reqs.size());
+  struct Pending {
+    const BlitDownloadRequest *req;
+    void *staging;
+    std::size_t copy_bytes;
+  };
+  std::vector<Pending> pending;
+  pending.reserve(reqs.size());
+  const auto release_all = [&]() {
+    for (auto &p : pending) metal::release_buffer(p.staging);
+  };
+
   for (const auto &r : reqs) {
     if (r.bytes == 0 || !r.src.gpu_buffer || !r.dst_data) continue;
-    const size_t copy_bytes = std::min(r.bytes, r.src.bytes);
+    const std::size_t copy_bytes = std::min(r.bytes, r.src.bytes);
     void *staging = metal::create_buffer(context_raw_device(ctx), copy_bytes,
                                          /*shared=*/true);
     if (!staging) {
-      for (auto &e : stagings) metal::release_buffer(e.staging);
+      release_all();
       throw std::runtime_error(
           "context_blit_download_views: staging allocation failed");
     }
-    stagings.push_back({staging, copy_bytes});
+    pending.push_back({&r, staging, copy_bytes});
   }
-  if (stagings.empty()) return;
+  if (pending.empty()) return;
 
   auto *cmd = metal::create_command_buffer(context_raw_queue(ctx));
-  size_t s = 0;
-  for (const auto &r : reqs) {
-    if (r.bytes == 0 || !r.src.gpu_buffer || !r.dst_data) continue;
-    metal::encode_blit_copy(cmd, r.src.gpu_buffer, r.src.offset,
-                            stagings[s].staging, 0,
-                            stagings[s].copy_bytes);
-    ++s;
+  for (const auto &p : pending) {
+    metal::encode_blit_copy(cmd, p.req->src.gpu_buffer, p.req->src.offset,
+                            p.staging, 0, p.copy_bytes);
   }
   metal::commit_and_wait(cmd);
   metal::release_command_buffer(cmd);
 
-  // Now memcpy from each staging into the caller's destination buffer.
-  s = 0;
-  for (const auto &r : reqs) {
-    if (r.bytes == 0 || !r.src.gpu_buffer || !r.dst_data) continue;
-    void *staging_data = metal::buffer_contents(stagings[s].staging);
+  for (auto &p : pending) {
+    void *staging_data = metal::buffer_contents(p.staging);
     if (!staging_data) {
-      for (auto &e : stagings) metal::release_buffer(e.staging);
+      release_all();
       throw std::runtime_error(
           "context_blit_download_views: staging is not CPU-visible");
     }
-    std::memcpy(r.dst_data, staging_data, stagings[s].copy_bytes);
-    ++s;
+    std::memcpy(p.req->dst_data, staging_data, p.copy_bytes);
   }
-  for (auto &e : stagings) metal::release_buffer(e.staging);
+  release_all();
 }
 
 } // namespace detail

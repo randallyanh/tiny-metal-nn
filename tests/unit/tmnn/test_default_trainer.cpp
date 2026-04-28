@@ -916,6 +916,41 @@ TEST(DefaultTrainer, OptimizerBlobRoundTrips) {
   EXPECT_EQ(round_tripped.payload, exported.payload);
 }
 
+// Phase 4 audit: pin the Shared-buffer round-trip path. The default
+// config uses use_private_buffers=true so the regular
+// OptimizerBlobRoundTrips test exercises the GPU blit-batch path; this
+// test forces the Shared path (export/import → CPU memcpy of view.data
+// directly) so the rewrite is covered in both modes.
+TEST(DefaultTrainer, OptimizerBlobRoundTripsWithSharedBuffers) {
+  auto ctx = MetalContext::create();
+  if (!ctx->is_gpu_available())
+    GTEST_SKIP() << "No GPU";
+
+  TrainerConfig train_cfg{.batch_size = 256};
+  train_cfg.use_private_buffers = false;
+  auto trainer = create_trainer({}, small_net(), train_cfg, ctx);
+  const auto plan = trainer.batch_plan();
+
+  std::vector<float> positions, targets;
+  make_sphere_batch(static_cast<int>(plan.max_batch_size),
+                    static_cast<int>(plan.input_dims), positions, targets);
+
+  auto result = trainer.training_step(
+      positions.data(), targets.data(),
+      static_cast<int>(plan.max_batch_size));
+  ASSERT_TRUE(std::isfinite(result.loss));
+  ASSERT_EQ(trainer.step(), 1u);
+
+  auto exported = trainer.export_optimizer_state();
+  ASSERT_FALSE(exported.payload.empty());
+
+  trainer.reset_optimizer();
+  trainer.import_optimizer_state(exported);
+  auto round_tripped = trainer.export_optimizer_state();
+  EXPECT_EQ(round_tripped.step, exported.step);
+  EXPECT_EQ(round_tripped.payload, exported.payload);
+}
+
 TEST(DefaultTrainer, OptimizerBlobRejectsUnsupportedVersion) {
   auto ctx = MetalContext::create();
   if (!ctx->is_gpu_available())

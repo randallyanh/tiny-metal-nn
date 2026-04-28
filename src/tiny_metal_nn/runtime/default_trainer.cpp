@@ -80,26 +80,6 @@ std::vector<uint8_t> copy_view_bytes(MetalContext &ctx, const BufferView &view,
   return out;
 }
 
-void write_view_bytes(MetalContext &ctx, const BufferView &view,
-                      const std::vector<uint8_t> &bytes, const char *label) {
-  if (view.bytes == 0)
-    return;
-  if (bytes.size() != view.bytes) {
-    throw std::runtime_error(std::string("DefaultRuntime: ") + label +
-                             " size mismatch");
-  }
-  if (view.data) {
-    std::memcpy(view.data, bytes.data(), bytes.size());
-    return;
-  }
-  if (!view.gpu_buffer) {
-    throw std::runtime_error(std::string("DefaultRuntime: ") + label +
-                             " is not backed by a GPU buffer");
-  }
-  auto mutable_view = view;
-  detail::context_blit_upload(ctx, mutable_view, bytes.data(), bytes.size());
-}
-
 void append_u32(std::vector<uint8_t> &out, uint32_t value) {
   out.push_back(static_cast<uint8_t>(value & 0xFFu));
   out.push_back(static_cast<uint8_t>((value >> 8) & 0xFFu));
@@ -1585,6 +1565,13 @@ struct DefaultRuntime final : ITrainerRuntime, InspectableTrainerRuntime {
     // Phase 4 followup: collect Private downloads into one batch so we
     // pay one commit_and_wait round-trip for the optimizer-state export
     // instead of one per Private section.
+    //
+    // INVARIANT: private_bufs.reserve(N) + at-most-N emplace_back keeps
+    // the outer vector from reallocating, so the inner vectors stay at
+    // fixed addresses and the data() pointers captured below remain
+    // valid until context_blit_download_views completes. Each section
+    // contributes at most one emplace_back, so std::size(sections) is
+    // a tight bound and the invariant holds by construction.
     std::vector<std::vector<uint8_t>> private_bufs;
     std::vector<detail::BlitDownloadRequest> downloads;
     private_bufs.reserve(std::size(sections));
@@ -1639,6 +1626,10 @@ struct DefaultRuntime final : ITrainerRuntime, InspectableTrainerRuntime {
     };
 
     // Read all sections first, then batch the Private uploads.
+    //
+    // INVARIANT: section_bytes.reserve(N) + exactly N emplace_back keeps
+    // the outer vector from reallocating; each inner vector's data()
+    // pointer remains valid until context_blit_upload_views completes.
     const uint8_t *cursor = state.payload.data();
     size_t remaining = state.payload.size();
     std::vector<std::vector<uint8_t>> section_bytes;
