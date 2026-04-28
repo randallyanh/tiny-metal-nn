@@ -26,6 +26,7 @@
 #include "tiny-metal-nn/detail/network_planning.h"
 #include "tiny-metal-nn/optimizer.h"
 #include "tiny-metal-nn/trainer.h"
+#include "tiny-metal-nn/weight_init.h"
 
 // Extension SDK headers — must compile without linking runtime.
 #include "tiny-metal-nn/evaluator.h"

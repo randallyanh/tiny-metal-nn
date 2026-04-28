@@ -17,6 +17,7 @@
 #include "tiny-metal-nn/detail/module.h"
 #include "tiny-metal-nn/optimizer.h"
 #include "tiny-metal-nn/detail/runtime_authority.h"
+#include "tiny-metal-nn/weight_init.h"
 
 #include <memory>
 #include <optional>
@@ -51,6 +52,12 @@ struct TrainerConfig {
   /// activation/gradient stats; results available in TrainingStepResult.probe.
   /// Disables SIMD training (scalar-only for probe correctness).
   bool enable_probes = false;
+
+  /// Weight initialization for the hash grid + MLP at trainer construction.
+  /// Defaults follow literature (hash grid uniform [-1e-4, 1e-4],
+  /// MLP Kaiming uniform). Override the seed for reproducibility across
+  /// multi-seed sweeps; see weight_init.h.
+  WeightInitConfig weight_init;
 };
 
 /// Snapshot of one compiled runtime kernel's requested vs realized dispatch.
