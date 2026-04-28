@@ -30,6 +30,7 @@
 #include <cmath>
 #include <cstring>
 #include <random>
+#include <span>
 #include <stdexcept>
 #include <vector>
 
@@ -1620,12 +1621,23 @@ struct DefaultRuntime final : ITrainerRuntime, InspectableTrainerRuntime {
     drain_pending_if_needed();
 
     param_store_->reset_adam_state();
-    zero_gpu_only_view(*ctx_, param_store_->fused_m());
-    zero_gpu_only_view(*ctx_, param_store_->fused_v());
-    zero_gpu_only_view(*ctx_, param_store_->adam_m_hash());
-    zero_gpu_only_view(*ctx_, param_store_->adam_v_hash());
-    zero_gpu_only_view(*ctx_, param_store_->adam_m_mlp());
-    zero_gpu_only_view(*ctx_, param_store_->adam_v_mlp());
+    // Phase 4: batched blit-fill for the Private Adam buffers (Shared
+    // are already zeroed by reset_adam_state's CPU memset).
+    {
+      const BufferView adam_zero_views[] = {
+          param_store_->fused_m(),     param_store_->fused_v(),
+          param_store_->adam_m_hash(), param_store_->adam_v_hash(),
+          param_store_->adam_m_mlp(),  param_store_->adam_v_mlp(),
+      };
+      BufferView gpu_only[6];
+      size_t n = 0;
+      for (const auto &v : adam_zero_views) {
+        if (!v.data && v.gpu_buffer && v.bytes > 0) gpu_only[n++] = v;
+      }
+      detail::context_blit_fill_views(*ctx_,
+                                      std::span<const BufferView>(gpu_only, n),
+                                      0);
+    }
     clear_training_step_state();
     step_ = 0;
   }
@@ -1847,14 +1859,30 @@ private:
         hash_init.data(), hash_init.size(),
         mlp_init.data(), mlp_init.size(), config_header);
 
-    // Zero Adam optimizer state (m/v buffers may contain garbage from arena reuse).
+    // Zero Adam optimizer state (m/v buffers may contain garbage from
+    // arena reuse). Phase 4: replaces six sequential commit_and_wait
+    // GPU sync round-trips with one batched blit-fill — Shared views
+    // are skipped at the helper boundary (their reset_adam_state CPU
+    // memset above already zeroed them), so the batch only does GPU
+    // work for Private buffers.
     param_store_->reset_adam_state();
-    zero_gpu_only_view(*ctx_, param_store_->fused_m());
-    zero_gpu_only_view(*ctx_, param_store_->fused_v());
-    zero_gpu_only_view(*ctx_, param_store_->adam_m_hash());
-    zero_gpu_only_view(*ctx_, param_store_->adam_v_hash());
-    zero_gpu_only_view(*ctx_, param_store_->adam_m_mlp());
-    zero_gpu_only_view(*ctx_, param_store_->adam_v_mlp());
+    {
+      const BufferView adam_zero_views[] = {
+          param_store_->fused_m(),     param_store_->fused_v(),
+          param_store_->adam_m_hash(), param_store_->adam_v_hash(),
+          param_store_->adam_m_mlp(),  param_store_->adam_v_mlp(),
+      };
+      // zero_gpu_only_view's "skip Shared" semantic is preserved by
+      // pre-filtering; context_blit_fill_views also skips empty entries.
+      BufferView gpu_only[6];
+      size_t n = 0;
+      for (const auto &v : adam_zero_views) {
+        if (!v.data && v.gpu_buffer && v.bytes > 0) gpu_only[n++] = v;
+      }
+      detail::context_blit_fill_views(*ctx_,
+                                      std::span<const BufferView>(gpu_only, n),
+                                      0);
+    }
     clear_training_step_state();
 
     // Create authority for evaluator access.

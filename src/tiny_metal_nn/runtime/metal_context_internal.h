@@ -18,6 +18,7 @@
 #include "tiny_metal_nn/runtime/pipeline_registry.h"
 
 #include <optional>
+#include <span>
 
 namespace tmnn::detail {
 
@@ -66,6 +67,14 @@ void *context_raw_queue(MetalContext &ctx);
 /// Blit-fill a buffer region with a byte value via Metal blit encoder.
 /// Requires gpu_available(). No-op if no device or no gpu_buffer.
 void context_blit_fill(MetalContext &ctx, BufferView &view, uint8_t value);
+
+/// Phase 4: batched blit-fill. Encodes N fillBuffer ops into ONE command
+/// buffer and commits-and-waits once, instead of paying the GPU sync
+/// round-trip per view. Views with no gpu_buffer or zero bytes are
+/// silently skipped. Returns immediately if the resulting batch is empty.
+void context_blit_fill_views(MetalContext &ctx,
+                             std::span<const BufferView> views,
+                             uint8_t value);
 
 /// Upload host bytes into a GPU-only buffer view via a staging blit.
 void context_blit_upload(MetalContext &ctx, BufferView &dst, const void *data,

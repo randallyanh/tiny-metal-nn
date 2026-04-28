@@ -25,6 +25,7 @@
 #include <cstring>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -427,6 +428,28 @@ void context_blit_fill(MetalContext &ctx, BufferView &view, uint8_t value) {
   auto *cmd = metal::create_command_buffer(context_raw_queue(ctx));
   metal::encode_blit_fill(cmd, view.gpu_buffer, view.offset, view.bytes,
                           value);
+  metal::commit_and_wait(cmd);
+  metal::release_command_buffer(cmd);
+}
+
+void context_blit_fill_views(MetalContext &ctx,
+                             std::span<const BufferView> views,
+                             uint8_t value) {
+  if (!ctx.is_gpu_available()) return;
+  // Skip zero-cost: we want exactly one cmdbuf to cover the whole batch,
+  // but if no view actually has GPU bytes to fill, don't pay for an empty
+  // commit_and_wait round-trip.
+  bool has_work = false;
+  for (const auto &v : views) {
+    if (v.gpu_buffer && v.bytes > 0) { has_work = true; break; }
+  }
+  if (!has_work) return;
+
+  auto *cmd = metal::create_command_buffer(context_raw_queue(ctx));
+  for (const auto &v : views) {
+    if (!v.gpu_buffer || v.bytes == 0) continue;
+    metal::encode_blit_fill(cmd, v.gpu_buffer, v.offset, v.bytes, value);
+  }
   metal::commit_and_wait(cmd);
   metal::release_command_buffer(cmd);
 }
