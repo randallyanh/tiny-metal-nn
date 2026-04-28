@@ -88,7 +88,14 @@ public:
                      const MetalContextHeapConfig &cfg) {
     metal_heap::HeapConfig hcfg;
     hcfg.transient_lane_count = 0;
-    hcfg.staging_max_bytes    = 0;
+    // Staging pool: cap is a CEILING, not eager reservation. The pool's
+    // bucket buffers are individual MTLBuffers (not heap sub-buffers), so
+    // they don't trigger MTLHeap's first-bind eager-commit pattern;
+    // resident bytes track only what gets acquired from the pool.
+    // 32 MiB is enough for the 4-section optimizer-state checkpoint
+    // round-trip with all power-of-2 buckets resident; smaller workloads
+    // pay only for the buckets they actually touch.
+    hcfg.staging_max_bytes    = 32 * 1024 * 1024;
 
     const auto derive_total = [&]() -> std::size_t {
       const double ws = static_cast<double>(device_info.recommended_working_set_bytes);
@@ -522,10 +529,61 @@ void context_blit_download(MetalContext &ctx, const BufferView &src, void *out,
   metal::release_buffer(staging);
 }
 
-// Per-request staging allocation. Could later route through metal_heap::
-// Staging for free-list reuse; for now matches the legacy single-call
-// helper's create-and-release pattern. The win is collapsing N
-// commit_and_wait round-trips into one, not the staging-buffer churn.
+// Helper: try to acquire a staging buffer from metal_heap::Staging
+// (size-class free-list reuse); if the pool is unavailable, disabled, or
+// exhausted, fall back to a fresh metal::create_buffer. Either way the
+// caller gets a usable Shared MTLBuffer; the difference is whether the
+// release path returns to the pool or releases outright.
+//
+// `heap_owned` carries the pool-backed lifetime when applicable; raw is
+// the void* the caller can use uniformly. Cleanup checks `heap_owned`'s
+// validity to dispatch.
+struct StagingHandle {
+  metal_heap::OwnedBuffer heap_owned;  // valid → dtor returns to pool
+  void *raw = nullptr;                 // fallback alloc if heap_owned empty
+  void *cpu = nullptr;
+};
+
+static StagingHandle acquire_staging(MetalContext &ctx, std::size_t bytes) {
+  StagingHandle h;
+  if (auto *heap = MetalContextAccessor::heap(ctx)) {
+    metal_heap::AllocDesc d;
+    d.bytes = bytes;
+    d.alignment = 256;
+    d.lifetime = metal_heap::Lifetime::Staging;
+    d.storage = metal_heap::Storage::Shared;
+    d.hazard_tracking = metal_heap::HazardTracking::Untracked;
+    d.debug_name = "tmnn.blit.staging";
+    auto r = heap->allocate(d);
+    if (r.has_value()) {
+      h.heap_owned = std::move(*r);
+      h.raw = h.heap_owned.mtl_buffer();
+      h.cpu = h.heap_owned.cpu_data();
+      return h;
+    }
+    // Fall through on StagingExhausted / disabled — direct alloc.
+  }
+  h.raw = metal::create_buffer(context_raw_device(ctx), bytes,
+                               /*shared=*/true);
+  if (h.raw) h.cpu = metal::buffer_contents(h.raw);
+  return h;
+}
+
+static void release_staging(StagingHandle &h) {
+  if (h.heap_owned.valid()) {
+    h.heap_owned = {};  // returns the bucket to the pool's free list
+  } else if (h.raw) {
+    metal::release_buffer(h.raw);
+  }
+  h.raw = nullptr;
+  h.cpu = nullptr;
+}
+
+// Per-request staging — first via metal_heap::Staging (size-class free
+// list, ~zero churn after warm-up), falling back to metal::create_buffer
+// when the pool is disabled, exhausted, or otherwise unavailable. The
+// commit_and_wait collapse stays the dominant win regardless of which
+// staging source backed each request.
 //
 // Implementation: filter into a `Pending` vector that pairs each accepted
 // request with its staging — eliminates the indices-in-lockstep fragility
@@ -536,40 +594,38 @@ void context_blit_upload_views(MetalContext &ctx,
 
   struct Pending {
     const BlitUploadRequest *req;
-    void *staging;
+    StagingHandle staging;
     std::size_t copy_bytes;
   };
   std::vector<Pending> pending;
   pending.reserve(reqs.size());
   const auto release_all = [&]() {
-    for (auto &p : pending) metal::release_buffer(p.staging);
+    for (auto &p : pending) release_staging(p.staging);
   };
 
   for (const auto &r : reqs) {
     if (r.bytes == 0 || !r.dst.gpu_buffer || !r.src_data) continue;
     const std::size_t copy_bytes = std::min(r.bytes, r.dst.bytes);
-    void *staging = metal::create_buffer(context_raw_device(ctx), copy_bytes,
-                                         /*shared=*/true);
-    if (!staging) {
+    StagingHandle staging = acquire_staging(ctx, copy_bytes);
+    if (!staging.raw) {
       release_all();
       throw std::runtime_error(
           "context_blit_upload_views: staging allocation failed");
     }
-    void *staging_data = metal::buffer_contents(staging);
-    if (!staging_data) {
-      metal::release_buffer(staging);
+    if (!staging.cpu) {
+      release_staging(staging);
       release_all();
       throw std::runtime_error(
           "context_blit_upload_views: staging is not CPU-visible");
     }
-    std::memcpy(staging_data, r.src_data, copy_bytes);
-    pending.push_back({&r, staging, copy_bytes});
+    std::memcpy(staging.cpu, r.src_data, copy_bytes);
+    pending.push_back({&r, std::move(staging), copy_bytes});
   }
   if (pending.empty()) return;
 
   auto *cmd = metal::create_command_buffer(context_raw_queue(ctx));
   for (const auto &p : pending) {
-    metal::encode_blit_copy(cmd, p.staging, 0,
+    metal::encode_blit_copy(cmd, p.staging.raw, 0,
                             p.req->dst.gpu_buffer, p.req->dst.offset,
                             p.copy_bytes);
   }
@@ -584,45 +640,44 @@ void context_blit_download_views(MetalContext &ctx,
 
   struct Pending {
     const BlitDownloadRequest *req;
-    void *staging;
+    StagingHandle staging;
     std::size_t copy_bytes;
   };
   std::vector<Pending> pending;
   pending.reserve(reqs.size());
   const auto release_all = [&]() {
-    for (auto &p : pending) metal::release_buffer(p.staging);
+    for (auto &p : pending) release_staging(p.staging);
   };
 
   for (const auto &r : reqs) {
     if (r.bytes == 0 || !r.src.gpu_buffer || !r.dst_data) continue;
     const std::size_t copy_bytes = std::min(r.bytes, r.src.bytes);
-    void *staging = metal::create_buffer(context_raw_device(ctx), copy_bytes,
-                                         /*shared=*/true);
-    if (!staging) {
+    StagingHandle staging = acquire_staging(ctx, copy_bytes);
+    if (!staging.raw) {
       release_all();
       throw std::runtime_error(
           "context_blit_download_views: staging allocation failed");
     }
-    pending.push_back({&r, staging, copy_bytes});
+    pending.push_back({&r, std::move(staging), copy_bytes});
   }
   if (pending.empty()) return;
 
   auto *cmd = metal::create_command_buffer(context_raw_queue(ctx));
   for (const auto &p : pending) {
     metal::encode_blit_copy(cmd, p.req->src.gpu_buffer, p.req->src.offset,
-                            p.staging, 0, p.copy_bytes);
+                            p.staging.raw, 0, p.copy_bytes);
   }
   metal::commit_and_wait(cmd);
   metal::release_command_buffer(cmd);
 
   for (auto &p : pending) {
-    void *staging_data = metal::buffer_contents(p.staging);
-    if (!staging_data) {
+    if (!p.staging.cpu) p.staging.cpu = metal::buffer_contents(p.staging.raw);
+    if (!p.staging.cpu) {
       release_all();
       throw std::runtime_error(
           "context_blit_download_views: staging is not CPU-visible");
     }
-    std::memcpy(p.req->dst_data, staging_data, p.copy_bytes);
+    std::memcpy(p.req->dst_data, p.staging.cpu, p.copy_bytes);
   }
   release_all();
 }
