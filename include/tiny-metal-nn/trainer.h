@@ -188,6 +188,21 @@ public:
   [[nodiscard]] virtual TrainerBatchPlan batch_plan() const = 0;
   [[nodiscard]] virtual OptimizerStateBlob export_optimizer_state() = 0;
   virtual void import_optimizer_state(const OptimizerStateBlob &state) = 0;
+  /// Phase 5: replace the current weights with caller-provided values.
+  /// Null pointer (with count=0) = skip that buffer. Resets the Adam
+  /// optimizer state and the step counter. Use case: transfer-learning
+  /// loads, restoring a snapshot's weights without its optimizer state,
+  /// or hand-crafted init for unit tests. Default implementation throws
+  /// (mock runtimes that don't own a parameter store can leave it).
+  virtual void set_initial_weights(const float *hash_weights,
+                                   std::size_t hash_count,
+                                   const float *mlp_weights,
+                                   std::size_t mlp_count) {
+    (void)hash_weights; (void)hash_count;
+    (void)mlp_weights;  (void)mlp_count;
+    throw std::runtime_error(
+        "set_initial_weights: not supported by this runtime");
+  }
   virtual void reset_optimizer() = 0;
   virtual void apply_optimizer_config(const Optimizer &opt) = 0;
   [[nodiscard]] virtual std::optional<DiagnosticInfo>
@@ -407,6 +422,19 @@ public:
   }
   void import_optimizer_state(const OptimizerStateBlob &state) {
     runtime_->import_optimizer_state(state);
+  }
+
+  /// Replace the current weights with caller-provided values. Each
+  /// pointer may be null (with corresponding count = 0) to skip that
+  /// buffer. The buffer-element counts must match the trainer's
+  /// hash_grid_size / mlp_weight_count exactly; size mismatch throws.
+  /// Resets the Adam optimizer state and the step counter — use this
+  /// for transfer learning, fixed-init unit tests, or restoring a
+  /// snapshot's weights without the corresponding optimizer state.
+  void set_initial_weights(const float *hash_weights, std::size_t hash_count,
+                           const float *mlp_weights, std::size_t mlp_count) {
+    runtime_->set_initial_weights(hash_weights, hash_count,
+                                  mlp_weights, mlp_count);
   }
 
   Module &model() { return *model_; }

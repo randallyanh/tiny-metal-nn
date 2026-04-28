@@ -1544,6 +1544,92 @@ struct DefaultRuntime final : ITrainerRuntime, InspectableTrainerRuntime {
   last_training_step_profile() const override {
     return last_training_step_profile_;
   }
+  void set_initial_weights(const float *hash_weights, std::size_t hash_count,
+                           const float *mlp_weights, std::size_t mlp_count) override {
+    if (!param_store_) {
+      throw std::runtime_error(
+          "DefaultRuntime::set_initial_weights: param_store not initialized");
+    }
+    drain_pending_if_needed();
+
+    const auto hash_view = param_store_->hash_weights();
+    const auto mlp_view  = param_store_->mlp_weights();
+
+    // Size validation against the actual buffer extents — wrong-size
+    // input is almost always a caller bug worth surfacing immediately
+    // rather than silently truncating.
+    if (hash_weights != nullptr) {
+      const std::size_t expected = hash_view.bytes / sizeof(float);
+      if (hash_count != expected) {
+        throw std::runtime_error(
+            std::string("set_initial_weights: hash_weights count mismatch: "
+                        "got ") + std::to_string(hash_count) +
+            " expected " + std::to_string(expected));
+      }
+    }
+    if (mlp_weights != nullptr) {
+      const std::size_t expected = mlp_view.bytes / sizeof(float);
+      if (mlp_count != expected) {
+        throw std::runtime_error(
+            std::string("set_initial_weights: mlp_weights count mismatch: "
+                        "got ") + std::to_string(mlp_count) +
+            " expected " + std::to_string(expected));
+      }
+    }
+
+    // Shared paths go through CPU memcpy (view.data is the host pointer
+    // into the same MTLBuffer the GPU sees). Private paths batch into
+    // ONE blit_upload_views round-trip.
+    std::vector<detail::BlitUploadRequest> uploads;
+    uploads.reserve(2);
+    if (hash_weights != nullptr && hash_count > 0) {
+      if (hash_view.data) {
+        std::memcpy(hash_view.data, hash_weights, hash_view.bytes);
+      } else if (hash_view.gpu_buffer) {
+        uploads.push_back({hash_view, hash_weights, hash_view.bytes});
+      }
+    }
+    if (mlp_weights != nullptr && mlp_count > 0) {
+      if (mlp_view.data) {
+        std::memcpy(mlp_view.data, mlp_weights, mlp_view.bytes);
+      } else if (mlp_view.gpu_buffer) {
+        uploads.push_back({mlp_view, mlp_weights, mlp_view.bytes});
+      }
+    }
+    if (!uploads.empty()) {
+      detail::context_blit_upload_views(*ctx_, uploads);
+    }
+    // Propagate the new MLP weights into config_weights' MLP section
+    // (same shape as init_parameter_store's sync). Without this the
+    // training kernel would still read the stale prior MLP from the
+    // config buffer.
+    if (mlp_weights != nullptr && mlp_count > 0) {
+      param_store_->sync_config_mlp_from_live_weights();
+    }
+
+    // Reset Adam optimizer state — same pattern as init_parameter_store
+    // and reset_optimizer (CPU memset for Shared, batched blit-fill for
+    // Private). Keeps the contract that fresh weights start from a
+    // fresh optimizer.
+    param_store_->reset_adam_state();
+    {
+      const BufferView adam_zero_views[] = {
+          param_store_->fused_m(),     param_store_->fused_v(),
+          param_store_->adam_m_hash(), param_store_->adam_v_hash(),
+          param_store_->adam_m_mlp(),  param_store_->adam_v_mlp(),
+      };
+      BufferView gpu_only[6];
+      std::size_t n = 0;
+      for (const auto &v : adam_zero_views) {
+        if (!v.data && v.gpu_buffer && v.bytes > 0) gpu_only[n++] = v;
+      }
+      detail::context_blit_fill_views(
+          *ctx_, std::span<const BufferView>(gpu_only, n), 0);
+    }
+    clear_training_step_state();
+    step_ = 0;
+  }
+
   [[nodiscard]] OptimizerStateBlob export_optimizer_state() override {
     OptimizerStateBlob blob;
     blob.version = kOptimizerStateBlobVersion;
@@ -1952,17 +2038,15 @@ private:
     }
 
     if (!init_reqs.empty()) {
-      // wait_for_completion = false: the downstream Adam-zero
-      // context_blit_fill_views in init_parameter_store and the first
-      // training_step's GPU work naturally sequence after these
-      // writes via Metal's in-order command queue, so blocking the
-      // host here only adds queue-wait latency (especially under
-      // shared-GPU load).
+      // wait_for_completion = true: fused_weights is Shared, so the
+      // downstream sync_config_mlp_from_live_weights call below
+      // (CPU memcpy from mlp_weights.data → config_weights MLP
+      // section) must see the GPU's writes. Async would race.
       detail::context_dispatch_init_uniform_views(
           *ctx_,
           std::span<const detail::InitUniformRequest>(
               init_reqs.data(), init_reqs.size()),
-          /*wait_for_completion=*/false);
+          /*wait_for_completion=*/true);
     }
     if (!zero_views.empty()) {
       detail::context_blit_fill_views(
@@ -1970,6 +2054,11 @@ private:
                                               zero_views.size()),
           0);
     }
+    // Mirror mlp_weights's contents into config_weights' MLP section.
+    // Pre-Phase-5 the legacy hydrate_weights call wrote to BOTH on
+    // the same code path; with the GPU init writing only mlp_weights,
+    // we need an explicit propagation.
+    param_store_->sync_config_mlp_from_live_weights();
   }
 
   void init_parameter_store() {

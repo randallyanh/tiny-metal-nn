@@ -918,6 +918,117 @@ TEST(DefaultTrainer, OptimizerBlobRoundTrips) {
   EXPECT_EQ(round_tripped.payload, exported.payload);
 }
 
+// Phase 5: two trainers sharing the same WeightInitConfig.seed must
+// produce bit-identical initial weights. Catches silent regressions in
+// the Philox kernel, counter_base offsetting, or any future per-trainer
+// nondeterminism that creeps into init_parameter_store.
+TEST(DefaultTrainer, WeightInitSeedReproducibleAcrossTrainers) {
+  auto ctx = MetalContext::create();
+  if (!ctx->is_gpu_available())
+    GTEST_SKIP() << "No GPU";
+  // Smaller hash config than HashGridEncoding's default (log2_hashmap=19
+  // ⇒ 64 MiB) so two concurrent Shared-storage trainers fit comfortably
+  // in the routed-mode 30 % Shared share of the 1 GiB heap floor.
+  HashGridEncoding::Config enc_cfg;
+  enc_cfg.log2_hashmap_size = 14;
+  TrainerConfig train_cfg{.batch_size = 256};
+  train_cfg.use_private_buffers = false;       // Need cpu_data to read back.
+  train_cfg.weight_init.seed = 0xDEADBEEFu;
+
+  auto enc_a = create_encoding(enc_cfg);
+  auto net_a = create_network(small_net());
+  auto model_a = create_network_with_input_encoding(enc_a, net_a);
+  auto t1 = create_trainer(model_a, train_cfg, ctx);
+  auto enc_b = create_encoding(enc_cfg);
+  auto net_b = create_network(small_net());
+  auto model_b = create_network_with_input_encoding(enc_b, net_b);
+  auto t2 = create_trainer(model_b, train_cfg, ctx);
+
+  std::vector<float> pos(256 * 3, 0.5f), tgt(256, 0.0f);
+  std::vector<float> out1(256), out2(256);
+  ASSERT_TRUE(t1.evaluate(pos.data(), out1.data(), 256));
+  ASSERT_TRUE(t2.evaluate(pos.data(), out2.data(), 256));
+  for (int i = 0; i < 256; ++i) {
+    EXPECT_FLOAT_EQ(out1[i], out2[i]) << "i=" << i;
+  }
+}
+
+// Phase 5: Trainer::set_initial_weights replaces weights and resets
+// optimizer / step. Two trainers with the SAME caller-provided weights
+// must evaluate identically.
+TEST(DefaultTrainer, SetInitialWeightsRoundTrips) {
+  auto ctx = MetalContext::create();
+  if (!ctx->is_gpu_available())
+    GTEST_SKIP() << "No GPU";
+  HashGridEncoding::Config enc_cfg;
+  enc_cfg.log2_hashmap_size = 14;
+  TrainerConfig train_cfg{.batch_size = 256};
+  train_cfg.use_private_buffers = false;
+  train_cfg.weight_init.seed = 1u;
+
+  auto enc_d = create_encoding(enc_cfg);
+  auto net_d = create_network(small_net());
+  auto model_d = create_network_with_input_encoding(enc_d, net_d);
+  auto donor = create_trainer(model_d, train_cfg, ctx);
+  // Read donor's weights via the runtime authority.
+  auto auth = donor.runtime_authority();
+  ASSERT_NE(auth, nullptr);
+  const auto layout = auth->parameter_layout();
+  std::vector<float> hash_buf(layout.hash_grid_float_count);
+  std::vector<float> mlp_buf(layout.mlp_weight_float_count);
+  // Pull from the donor's Shared buffers via runtime_authority's view.
+  auto hash_rv = auth->buffer(RuntimeBufferRole::HashWeights);
+  auto mlp_rv  = auth->buffer(RuntimeBufferRole::MlpWeights);
+  ASSERT_NE(hash_rv.cpu_data, nullptr);
+  ASSERT_NE(mlp_rv.cpu_data,  nullptr);
+  std::memcpy(hash_buf.data(), hash_rv.cpu_data,
+              hash_buf.size() * sizeof(float));
+  std::memcpy(mlp_buf.data(), mlp_rv.cpu_data,
+              mlp_buf.size() * sizeof(float));
+
+  // New trainer with a different seed → different default init.
+  TrainerConfig other_cfg = train_cfg;
+  other_cfg.weight_init.seed = 999u;
+  auto enc_r = create_encoding(enc_cfg);
+  auto net_r = create_network(small_net());
+  auto model_r = create_network_with_input_encoding(enc_r, net_r);
+  auto trainer = create_trainer(model_r, other_cfg, ctx);
+
+  // Inject donor's weights post-construction.
+  trainer.set_initial_weights(hash_buf.data(), hash_buf.size(),
+                              mlp_buf.data(),  mlp_buf.size());
+
+  // Step counter reset by set_initial_weights.
+  EXPECT_EQ(trainer.step(), 0u);
+
+  // Both trainers must now evaluate identically.
+  std::vector<float> pos(256 * 3, 0.25f);
+  std::vector<float> out_donor(256), out_recipient(256);
+  ASSERT_TRUE(donor.evaluate(pos.data(), out_donor.data(), 256));
+  ASSERT_TRUE(trainer.evaluate(pos.data(), out_recipient.data(), 256));
+  for (int i = 0; i < 256; ++i) {
+    EXPECT_FLOAT_EQ(out_recipient[i], out_donor[i]) << "i=" << i;
+  }
+}
+
+// Size mismatch must throw — caller bug surfaced loudly rather than
+// silently truncating.
+TEST(DefaultTrainer, SetInitialWeightsRejectsSizeMismatch) {
+  auto ctx = MetalContext::create();
+  if (!ctx->is_gpu_available())
+    GTEST_SKIP() << "No GPU";
+  auto trainer = create_trainer({}, small_net(), {.batch_size = 256}, ctx);
+  std::vector<float> wrong_size(7, 0.0f);
+  EXPECT_THROW(
+      trainer.set_initial_weights(wrong_size.data(), wrong_size.size(),
+                                  nullptr, 0),
+      std::runtime_error);
+  EXPECT_THROW(
+      trainer.set_initial_weights(nullptr, 0,
+                                  wrong_size.data(), wrong_size.size()),
+      std::runtime_error);
+}
+
 // Phase 4 followup: pin that the metal_heap::Staging pool is actually
 // being used by context_blit_*_views — assert post-checkpoint that the
 // pool has resident buffers AND the fallback counter stayed at zero.
