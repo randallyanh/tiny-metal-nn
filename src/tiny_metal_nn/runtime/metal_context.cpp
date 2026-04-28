@@ -14,6 +14,7 @@
 #include "tiny-metal-nn/metal_context.h"
 #include "tiny_metal_nn/runtime/buffer_arena.h"
 #include "tiny_metal_nn/runtime/command_batch.h"
+#include "tiny_metal_nn/runtime/metal_context_internal.h"
 #include "tiny_metal_nn/runtime/metal_device.h"
 #include "tiny_metal_nn/runtime/metal_heap/metal_heap.h"
 #include "tiny_metal_nn/runtime/numerics_guard.h"
@@ -519,6 +520,105 @@ void context_blit_download(MetalContext &ctx, const BufferView &src, void *out,
   }
   std::memcpy(out, staging_data, copy_bytes);
   metal::release_buffer(staging);
+}
+
+// Per-request staging allocation. Could later route through metal_heap::
+// Staging for free-list reuse; for now matches the legacy single-call
+// helper's create-and-release pattern. The win here is collapsing N
+// commit_and_wait into one, not the staging-buffer churn.
+void context_blit_upload_views(MetalContext &ctx,
+                               std::span<const BlitUploadRequest> reqs) {
+  if (!ctx.is_gpu_available() || reqs.empty()) return;
+
+  struct StagingEntry { void *staging; size_t copy_bytes; };
+  std::vector<StagingEntry> stagings;
+  stagings.reserve(reqs.size());
+  // Allocate + memcpy into staging for every request first, so the
+  // command buffer encodes a flat list of blit-copies with no host work
+  // interleaved.
+  for (const auto &r : reqs) {
+    if (r.bytes == 0 || !r.dst.gpu_buffer || !r.src_data) continue;
+    const size_t copy_bytes = std::min(r.bytes, r.dst.bytes);
+    void *staging = metal::create_buffer(context_raw_device(ctx), copy_bytes,
+                                         /*shared=*/true);
+    if (!staging) {
+      for (auto &e : stagings) metal::release_buffer(e.staging);
+      throw std::runtime_error(
+          "context_blit_upload_views: staging allocation failed");
+    }
+    void *staging_data = metal::buffer_contents(staging);
+    if (!staging_data) {
+      metal::release_buffer(staging);
+      for (auto &e : stagings) metal::release_buffer(e.staging);
+      throw std::runtime_error(
+          "context_blit_upload_views: staging is not CPU-visible");
+    }
+    std::memcpy(staging_data, r.src_data, copy_bytes);
+    stagings.push_back({staging, copy_bytes});
+  }
+  if (stagings.empty()) return;
+
+  auto *cmd = metal::create_command_buffer(context_raw_queue(ctx));
+  size_t s = 0;
+  for (const auto &r : reqs) {
+    if (r.bytes == 0 || !r.dst.gpu_buffer || !r.src_data) continue;
+    metal::encode_blit_copy(cmd, stagings[s].staging, 0,
+                            r.dst.gpu_buffer, r.dst.offset,
+                            stagings[s].copy_bytes);
+    ++s;
+  }
+  metal::commit_and_wait(cmd);
+  metal::release_command_buffer(cmd);
+  for (auto &e : stagings) metal::release_buffer(e.staging);
+}
+
+void context_blit_download_views(MetalContext &ctx,
+                                 std::span<const BlitDownloadRequest> reqs) {
+  if (!ctx.is_gpu_available() || reqs.empty()) return;
+
+  struct StagingEntry { void *staging; size_t copy_bytes; };
+  std::vector<StagingEntry> stagings;
+  stagings.reserve(reqs.size());
+  for (const auto &r : reqs) {
+    if (r.bytes == 0 || !r.src.gpu_buffer || !r.dst_data) continue;
+    const size_t copy_bytes = std::min(r.bytes, r.src.bytes);
+    void *staging = metal::create_buffer(context_raw_device(ctx), copy_bytes,
+                                         /*shared=*/true);
+    if (!staging) {
+      for (auto &e : stagings) metal::release_buffer(e.staging);
+      throw std::runtime_error(
+          "context_blit_download_views: staging allocation failed");
+    }
+    stagings.push_back({staging, copy_bytes});
+  }
+  if (stagings.empty()) return;
+
+  auto *cmd = metal::create_command_buffer(context_raw_queue(ctx));
+  size_t s = 0;
+  for (const auto &r : reqs) {
+    if (r.bytes == 0 || !r.src.gpu_buffer || !r.dst_data) continue;
+    metal::encode_blit_copy(cmd, r.src.gpu_buffer, r.src.offset,
+                            stagings[s].staging, 0,
+                            stagings[s].copy_bytes);
+    ++s;
+  }
+  metal::commit_and_wait(cmd);
+  metal::release_command_buffer(cmd);
+
+  // Now memcpy from each staging into the caller's destination buffer.
+  s = 0;
+  for (const auto &r : reqs) {
+    if (r.bytes == 0 || !r.src.gpu_buffer || !r.dst_data) continue;
+    void *staging_data = metal::buffer_contents(stagings[s].staging);
+    if (!staging_data) {
+      for (auto &e : stagings) metal::release_buffer(e.staging);
+      throw std::runtime_error(
+          "context_blit_download_views: staging is not CPU-visible");
+    }
+    std::memcpy(r.dst_data, staging_data, stagings[s].copy_bytes);
+    ++s;
+  }
+  for (auto &e : stagings) metal::release_buffer(e.staging);
 }
 
 } // namespace detail

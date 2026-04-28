@@ -828,6 +828,51 @@ void run_reset_optimizer_microbench() {
               kIter, med, mn / 1.0e6, mx / 1.0e6);
 }
 
+// Phase 4 followup microbench: timed export_optimizer_state +
+// import_optimizer_state round-trip. Pre-batching this path did 4
+// GPU sync round-trips on export and 4 + 2 (clear_state) on import.
+// 100 iterations on a warmed-up trainer.
+void run_checkpoint_microbench() {
+  auto ctx = MetalContext::create();
+  if (!ctx->is_gpu_available()) {
+    std::printf("tmnn checkpoint-microbench: skipped (no GPU)\n");
+    return;
+  }
+  const auto enc_cfg = default_trainer_encoding_config();
+  const auto net_cfg = default_trainer_network_config(enc_cfg);
+  const auto train_cfg = default_trainer_config();
+  auto trainer = create_trainer(enc_cfg, net_cfg, train_cfg, ctx);
+  // Warm-up: get past PSO compile and first GPU dispatch.
+  const auto plan = trainer.batch_plan();
+  const int N = static_cast<int>(plan.max_batch_size);
+  std::vector<float> positions(static_cast<size_t>(N) * plan.input_dims, 0.0f);
+  std::vector<float> targets(static_cast<size_t>(N) * plan.target_dims, 0.0f);
+  (void)trainer.training_step(positions.data(), targets.data(), N);
+  (void)trainer.export_optimizer_state();
+
+  constexpr int kIter = 100;
+  std::vector<uint64_t> export_samples, import_samples;
+  export_samples.reserve(kIter);
+  import_samples.reserve(kIter);
+  for (int i = 0; i < kIter; ++i) {
+    const auto t0 = std::chrono::steady_clock::now();
+    auto blob = trainer.export_optimizer_state();
+    const auto t1 = std::chrono::steady_clock::now();
+    trainer.import_optimizer_state(blob);
+    const auto t2 = std::chrono::steady_clock::now();
+    export_samples.push_back(static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
+    import_samples.push_back(static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count()));
+  }
+  const auto exp_med = median_ns(std::vector(export_samples)) / 1.0e6;
+  const auto imp_med = median_ns(std::vector(import_samples)) / 1.0e6;
+  std::printf("tmnn checkpoint-microbench [default-path, %d iter]: "
+              "export median=%.3f ms, import median=%.3f ms, "
+              "round-trip median=%.3f ms\n",
+              kIter, exp_med, imp_med, exp_med + imp_med);
+}
+
 // G4: wired-memory snapshot — phys_footprint before/after constructing a
 // trainer and after destroying it. Persistent reservation + per-step
 // transient capacity dominate the resident delta. Honors
@@ -1064,6 +1109,7 @@ int main(int argc, char **argv) {
   bool cold_start_attribution = false;
   bool heap_commit_probe = false;
   bool reset_optimizer_microbench = false;
+  bool checkpoint_microbench = false;
   bool wired_memory_trace = false;
   bool allocate_microbench = false;
   for (int i = 1; i < argc; ++i) {
@@ -1084,6 +1130,8 @@ int main(int argc, char **argv) {
       heap_commit_probe = true;
     else if (std::string_view(argv[i]) == "--reset-optimizer-microbench")
       reset_optimizer_microbench = true;
+    else if (std::string_view(argv[i]) == "--checkpoint-microbench")
+      checkpoint_microbench = true;
     else if (std::string_view(argv[i]) == "--wired-memory-trace")
       wired_memory_trace = true;
     else if (std::string_view(argv[i]) == "--allocate-microbench")
@@ -1106,6 +1154,10 @@ int main(int argc, char **argv) {
   }
   if (reset_optimizer_microbench) {
     run_reset_optimizer_microbench();
+    return 0;
+  }
+  if (checkpoint_microbench) {
+    run_checkpoint_microbench();
     return 0;
   }
   if (wired_memory_trace) {

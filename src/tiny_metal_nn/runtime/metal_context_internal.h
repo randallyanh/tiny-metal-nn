@@ -76,6 +76,29 @@ void context_blit_fill_views(MetalContext &ctx,
                              std::span<const BufferView> views,
                              uint8_t value);
 
+/// Phase 4 followup: batched host→Private upload. Allocates one Shared
+/// staging MTLBuffer per request, memcpy's source bytes in, encodes N
+/// blit-copies into ONE command buffer, commits-and-waits once, then
+/// releases all staging buffers. Replaces N sequential context_blit_upload
+/// calls (each of which did its own create_buffer + commit_and_wait +
+/// release_buffer cycle) with one round-trip + one staging burst.
+struct BlitUploadRequest {
+  BufferView dst;
+  const void *src_data;
+  std::size_t bytes;
+};
+void context_blit_upload_views(MetalContext &ctx,
+                               std::span<const BlitUploadRequest> reqs);
+
+/// Phase 4 followup: batched Private→host download, mirror of upload.
+struct BlitDownloadRequest {
+  BufferView src;
+  void *dst_data;
+  std::size_t bytes;
+};
+void context_blit_download_views(MetalContext &ctx,
+                                 std::span<const BlitDownloadRequest> reqs);
+
 /// Upload host bytes into a GPU-only buffer view via a staging blit.
 void context_blit_upload(MetalContext &ctx, BufferView &dst, const void *data,
                          size_t bytes);

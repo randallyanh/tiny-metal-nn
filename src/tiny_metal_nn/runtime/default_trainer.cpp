@@ -1575,14 +1575,46 @@ struct DefaultRuntime final : ITrainerRuntime, InspectableTrainerRuntime {
       return blob;
 
     auto &ps = *param_store_;
-    append_section(blob.payload,
-                   copy_view_bytes(*ctx_, ps.adam_m_hash(), "adam_m_hash"));
-    append_section(blob.payload,
-                   copy_view_bytes(*ctx_, ps.adam_v_hash(), "adam_v_hash"));
-    append_section(blob.payload,
-                   copy_view_bytes(*ctx_, ps.adam_m_mlp(), "adam_m_mlp"));
-    append_section(blob.payload,
-                   copy_view_bytes(*ctx_, ps.adam_v_mlp(), "adam_v_mlp"));
+    const std::pair<BufferView, const char *> sections[] = {
+        {ps.adam_m_hash(), "adam_m_hash"},
+        {ps.adam_v_hash(), "adam_v_hash"},
+        {ps.adam_m_mlp(),  "adam_m_mlp"},
+        {ps.adam_v_mlp(),  "adam_v_mlp"},
+    };
+
+    // Phase 4 followup: collect Private downloads into one batch so we
+    // pay one commit_and_wait round-trip for the optimizer-state export
+    // instead of one per Private section.
+    std::vector<std::vector<uint8_t>> private_bufs;
+    std::vector<detail::BlitDownloadRequest> downloads;
+    private_bufs.reserve(std::size(sections));
+    downloads.reserve(std::size(sections));
+    for (const auto &[view, label] : sections) {
+      if (view.bytes > 0 && !view.data && view.gpu_buffer) {
+        private_bufs.emplace_back(view.bytes);
+        downloads.push_back({view, private_bufs.back().data(), view.bytes});
+      } else if (view.bytes > 0 && !view.data && !view.gpu_buffer) {
+        throw std::runtime_error(std::string("DefaultRuntime: ") + label +
+                                 " is not backed by a GPU buffer");
+      }
+    }
+    detail::context_blit_download_views(*ctx_, downloads);
+
+    // Now serialize sections in order — Shared straight from cpu_data,
+    // Private from the just-downloaded staging copies.
+    size_t priv_idx = 0;
+    for (const auto &[view, label] : sections) {
+      std::vector<uint8_t> bytes;
+      if (view.bytes == 0) {
+        // empty section — append_section writes a zero-length record
+      } else if (view.data) {
+        auto *p = static_cast<const uint8_t *>(view.data);
+        bytes.assign(p, p + view.bytes);
+      } else {
+        bytes = std::move(private_bufs[priv_idx++]);
+      }
+      append_section(blob.payload, bytes);
+    }
     return blob;
   }
   void import_optimizer_state(const OptimizerStateBlob &state) override {
@@ -1599,20 +1631,48 @@ struct DefaultRuntime final : ITrainerRuntime, InspectableTrainerRuntime {
     }
 
     auto &ps = *param_store_;
+    const std::pair<BufferView, const char *> sections[] = {
+        {ps.adam_m_hash(), "adam_m_hash"},
+        {ps.adam_v_hash(), "adam_v_hash"},
+        {ps.adam_m_mlp(),  "adam_m_mlp"},
+        {ps.adam_v_mlp(),  "adam_v_mlp"},
+    };
+
+    // Read all sections first, then batch the Private uploads.
     const uint8_t *cursor = state.payload.data();
     size_t remaining = state.payload.size();
-    write_view_bytes(*ctx_, ps.adam_m_hash(),
-                     read_section(cursor, remaining), "adam_m_hash");
-    write_view_bytes(*ctx_, ps.adam_v_hash(),
-                     read_section(cursor, remaining), "adam_v_hash");
-    write_view_bytes(*ctx_, ps.adam_m_mlp(),
-                     read_section(cursor, remaining), "adam_m_mlp");
-    write_view_bytes(*ctx_, ps.adam_v_mlp(),
-                     read_section(cursor, remaining), "adam_v_mlp");
+    std::vector<std::vector<uint8_t>> section_bytes;
+    section_bytes.reserve(std::size(sections));
+    for (size_t i = 0; i < std::size(sections); ++i) {
+      section_bytes.emplace_back(read_section(cursor, remaining));
+    }
     if (remaining != 0) {
       throw std::runtime_error(
           "DefaultRuntime: optimizer blob has trailing bytes");
     }
+
+    // Phase 4 followup: route Private sections through one batched
+    // upload (one commit_and_wait), Shared sections through CPU memcpy.
+    std::vector<detail::BlitUploadRequest> uploads;
+    uploads.reserve(std::size(sections));
+    for (size_t i = 0; i < std::size(sections); ++i) {
+      const auto &[view, label] = sections[i];
+      const auto &bytes = section_bytes[i];
+      if (view.bytes == 0) continue;
+      if (bytes.size() != view.bytes) {
+        throw std::runtime_error(std::string("DefaultRuntime: ") + label +
+                                 " size mismatch");
+      }
+      if (view.data) {
+        std::memcpy(view.data, bytes.data(), bytes.size());
+      } else if (view.gpu_buffer) {
+        uploads.push_back({view, bytes.data(), bytes.size()});
+      } else {
+        throw std::runtime_error(std::string("DefaultRuntime: ") + label +
+                                 " is not backed by a GPU buffer");
+      }
+    }
+    detail::context_blit_upload_views(*ctx_, uploads);
 
     clear_training_step_state();
     step_ = state.step;
@@ -1665,10 +1725,28 @@ private:
       step_state_clear_required_ = false;
       return;
     }
-    zero_buffer_view(*ctx_, param_store_->grad_hash());
-    zero_buffer_view(*ctx_, param_store_->grad_mlp());
-    zero_buffer_view(*ctx_, param_store_->active_hash_mask());
-    zero_buffer_view(*ctx_, param_store_->active_hash_summary_mask());
+    // Phase 4 followup: Shared views go through CPU memset; Private
+    // views go into ONE batched blit-fill (was up to four sequential
+    // commit_and_wait round-trips, one per Private grad buffer).
+    const BufferView views[] = {
+        param_store_->grad_hash(),
+        param_store_->grad_mlp(),
+        param_store_->active_hash_mask(),
+        param_store_->active_hash_summary_mask(),
+    };
+    BufferView gpu_only[4];
+    size_t n = 0;
+    for (const auto &v : views) {
+      if (v.bytes == 0) continue;
+      if (v.data) {
+        std::memset(v.data, 0, v.bytes);  // Shared: CPU memset
+      } else if (v.gpu_buffer) {
+        gpu_only[n++] = v;                // Private: defer to batched fill
+      }
+    }
+    detail::context_blit_fill_views(*ctx_,
+                                    std::span<const BufferView>(gpu_only, n),
+                                    0);
     step_state_clear_required_ = false;
   }
 
