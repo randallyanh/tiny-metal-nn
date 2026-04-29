@@ -87,7 +87,7 @@ For users moving from `tinycudann`, a migration tool
 (`tools/migrate_tcnn.py`) handles the mechanical conversion (imports + the
 canonical 5-line training-loop body); the harder cases (custom losses,
 non-canonical shapes) are flagged with actionable diagnostics. A worked
-example pair lives at `examples/migrated/sphere_sdf/`. See
+example pair lives at `examples/sphere_sdf/`. See
 [`docs/TCNN-MIGRATION-GUIDE.md`](docs/TCNN-MIGRATION-GUIDE.md) § 10.
 
 For an instrumented build with AddressSanitizer + UndefinedBehaviorSanitizer

@@ -23,7 +23,7 @@ sphere_sdf/
 2. Ran the CLI in `--check` mode to see the diagnostics:
 
    ```
-   $ python tools/migrate_tcnn.py examples/migrated/sphere_sdf/tcnn/train.py --check
+   $ python tools/migrate_tcnn.py examples/sphere_sdf/tcnn/train.py --check
    ...:6: info: rewrote `import tinycudann as tcnn` to `import tiny_metal_nn as tmnn`
    ...:39: warning: tcnn.NetworkWithInputEncoding(...) does not have a 1-to-1 tmnn equivalent...
    ...:50: warning: training loop with .backward() + .step() detected...
@@ -32,8 +32,8 @@ sphere_sdf/
 3. Applied the mechanical rewrites with `--output`:
 
    ```
-   $ python tools/migrate_tcnn.py examples/migrated/sphere_sdf/tcnn/train.py \
-         --output examples/migrated/sphere_sdf/tmnn/train.py.partial
+   $ python tools/migrate_tcnn.py examples/sphere_sdf/tcnn/train.py \
+         --output examples/sphere_sdf/tmnn/train.py.partial
    ```
 
 4. Layered the manual edits the CLI flagged (the WARNING-level
@@ -72,7 +72,7 @@ From the repo root, with the dev venv active and `tiny_metal_nn` built
 (see `tests/python/README.md` for the venv setup):
 
 ```
-.venv/bin/python examples/migrated/sphere_sdf/tmnn/train.py
+.venv/bin/python examples/sphere_sdf/tmnn/train.py
 ```
 
 ### tcnn version (CUDA only — the original)
@@ -83,7 +83,7 @@ convergence claim on a CUDA box. Apple Silicon users can ignore it.
 
 ```
 # on a CUDA-capable machine, with tinycudann installed
-python examples/migrated/sphere_sdf/tcnn/train.py
+python examples/sphere_sdf/tcnn/train.py
 ```
 
 ## Cross-implementation comparison (status)

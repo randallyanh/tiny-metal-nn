@@ -236,7 +236,7 @@ documented in the configuration freeze.
 | `tools/migrate_tcnn.py` | CLI: `tmnn-migrate <file.py> [--check / --diff / --output ...]`. Uses libcst for source rewriting (preserves comments + blank lines). Mechanically rewrites `import tinycudann` and the canonical 5-line training loop body; flags `tcnn.NetworkWithInputEncoding(...)` calls for human / AI follow-up. |
 | `.claude/skills/tcnn-to-tmnn.md` | Claude Code skill that consumes the same rules and handles the AST-uncovered cases (custom losses, multi-file projects, judgement calls). |
 
-A worked example pair lives at `examples/migrated/sphere_sdf/`:
+A worked example pair lives at `examples/sphere_sdf/`:
 
 - `tcnn/train.py` — original tinycudann (CUDA) version, runnable on a
   CUDA box.

@@ -3,8 +3,8 @@
 Drop-in equivalent of `../tcnn/train.py`. Same dataset, same optimizer
 shape, same step count — produced by running
 
-    python tools/migrate_tcnn.py examples/migrated/sphere_sdf/tcnn/train.py \\
-        --output examples/migrated/sphere_sdf/tmnn/train.py
+    python tools/migrate_tcnn.py examples/sphere_sdf/tcnn/train.py \\
+        --output examples/sphere_sdf/tmnn/train.py
 
 then layering the manual edits the migration tool flagged (see the
 parent README for the exact diff and rationale per change).

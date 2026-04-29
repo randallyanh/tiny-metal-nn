@@ -1,4 +1,4 @@
-"""CI convergence guard for `examples/migrated/`.
+"""CI convergence guard for `examples/`.
 
 Per 006 v2 §4.3 / §11 stage 10: any PR that breaks one of the
 migration examples should fail CI before merge. The cross-comparison
@@ -21,7 +21,7 @@ import pytest
 
 # Examples are not a Python package; add the example dir to the path
 # so we can import its `train` module directly.
-_EXAMPLES_ROOT = Path(__file__).resolve().parents[2] / "examples" / "migrated"
+_EXAMPLES_ROOT = Path(__file__).resolve().parents[2] / "examples"
 sys.path.insert(0, str(_EXAMPLES_ROOT / "sphere_sdf" / "tmnn"))
 
 

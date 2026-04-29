@@ -134,7 +134,7 @@ training-loop body) and flag the rest:
 
 A worked example pair (the original tcnn version + the migrated tmnn
 version + a CI convergence check) lives at
-`examples/migrated/sphere_sdf/`. See
+`examples/sphere_sdf/`. See
 [`docs/TCNN-MIGRATION-GUIDE.md`](TCNN-MIGRATION-GUIDE.md) § 10 for the
 field-by-field schema diff and the manual-edit catalog.
 

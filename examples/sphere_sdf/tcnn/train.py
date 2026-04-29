@@ -6,7 +6,7 @@ MSE loss → Adam optimizer.
 
 This file is the **before** of the tcnn → tmnn migration. The migrated
 Apple Silicon equivalent lives next door in
-`examples/migrated/sphere_sdf/tmnn/train.py`. See the README for how
+`examples/sphere_sdf/tmnn/train.py`. See the README for how
 they were related.
 
 Runtime requirements (this file):

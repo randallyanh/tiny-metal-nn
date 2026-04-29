@@ -15,7 +15,7 @@ In scope:
 - Performance work backed by `tests/benchmarks/tmnn_runtime_benchmarks.cpp` numbers
 - Documentation and reproducibility improvements
 - Additional flagship samples that follow the `samples/mlp_learning_an_image.cpp` pattern (≤ 400 LOC, runnable from a clean clone, mirrors a tcnn / instant-ngp-style workload where applicable)
-- Python binding work that follows the v1.0 design contract in [`docs/know-how/006-python-binding-design.md`](docs/know-how/006-python-binding-design.md) (single `tiny_metal_nn` namespace, fused `Trainer.training_step`) and the migration tooling deliverables (`tools/migrate_tcnn.py` CLI, `.claude/skills/tcnn-to-tmnn.md` skill, `examples/migrated/`)
+- Python binding work that follows the v1.0 design contract in [`docs/know-how/006-python-binding-design.md`](docs/know-how/006-python-binding-design.md) (single `tiny_metal_nn` namespace, fused `Trainer.training_step`) and the migration tooling deliverables (`tools/migrate_tcnn.py` CLI, `.claude/skills/tcnn-to-tmnn.md` skill, `examples/<network>/`)
 
 Out of scope:
 
