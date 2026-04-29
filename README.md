@@ -40,7 +40,7 @@ Targets:
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design.
 
-## Build
+## Build (C++)
 
 `tmnn` uses [vcpkg](https://github.com/microsoft/vcpkg) for `nlohmann_json` and
 `gtest`. Either place a vcpkg checkout at `./.deps/vcpkg`, or point
@@ -63,6 +63,32 @@ cmake --build build -j
 ./build/samples/mlp_learning_an_image my_config.json            # ...with a custom JSON config
 ctest --test-dir build -V                                       # tests
 ```
+
+## Python binding (optional)
+
+A pybind11 binding ships alongside the C++ library. Install via the
+project's build backend (scikit-build-core, which invokes the same CMake
+project with `-DTMNN_BUILD_PYTHON_MODULE=ON`):
+
+```bash
+python3.13 -m venv .venv
+.venv/bin/pip install scikit-build-core pybind11
+VCPKG_ROOT=~/vcpkg .venv/bin/pip install -e ".[dev]" --no-build-isolation
+.venv/bin/python -c "import tiny_metal_nn as tmnn; print(tmnn.__version__)"
+```
+
+The editable install reuses a persistent CMake binary directory, so subsequent
+edits to `src/python/` (or any C++ source the binding pulls in) auto-rebuild
+on the next `import tiny_metal_nn`. See [`docs/QUICKSTART.md`](docs/QUICKSTART.md)
+for a Python "hello world" and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+§ 6 for the binding's design.
+
+For users moving from `tinycudann`, a migration tool
+(`tools/migrate_tcnn.py`) handles the mechanical conversion (imports + the
+canonical 5-line training-loop body); the harder cases (custom losses,
+non-canonical shapes) are flagged with actionable diagnostics. A worked
+example pair lives at `examples/migrated/sphere_sdf/`. See
+[`docs/TCNN-MIGRATION-GUIDE.md`](docs/TCNN-MIGRATION-GUIDE.md) § 10.
 
 For an instrumented build with AddressSanitizer + UndefinedBehaviorSanitizer
 (off by default; consumers must rebuild any downstream code with the same
@@ -108,11 +134,11 @@ Apple frameworks (system, macOS): Metal, Foundation.
 ## Documentation
 
 - [`STATUS.md`](STATUS.md) — single source of truth for what works and what does not
-- [`docs/QUICKSTART.md`](docs/QUICKSTART.md) — five-minute first program
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — internal design
+- [`docs/QUICKSTART.md`](docs/QUICKSTART.md) — five-minute first program (C++ and Python)
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — internal design (C++ runtime + Python binding + migration tooling)
 - [`docs/VS-MLX-AND-TCNN.md`](docs/VS-MLX-AND-TCNN.md) — honest comparison with named alternatives
 - [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) — benchmark methodology and how to run the benchmark binary
-- [`docs/TCNN-MIGRATION-GUIDE.md`](docs/TCNN-MIGRATION-GUIDE.md) — porting tcnn projects to tmnn
+- [`docs/TCNN-MIGRATION-GUIDE.md`](docs/TCNN-MIGRATION-GUIDE.md) — porting tcnn projects to tmnn (C++ + Python)
 - [`docs/CHECKPOINT-CONTRACT.md`](docs/CHECKPOINT-CONTRACT.md) — optimizer-state checkpoint format
 - [`docs/EXTENSIBILITY-DESIGN.md`](docs/EXTENSIBILITY-DESIGN.md) — extension SDK
 - [`docs/ERROR-HANDLING.md`](docs/ERROR-HANDLING.md) — `Result<T>` + `DiagnosticCode` contract
@@ -126,8 +152,12 @@ expect breaking changes on `main` without deprecation notice:
    architecture-equivalent models on both sides
 2. At least two additional flagship samples (NeRF synthetic, hash-grid SDF
    fitting)
-3. CI matrix (macOS Apple Silicon + Linux Metal-stub)
-4. `MAINTAINERS.md` with response SLA
+3. CI matrix workflows shipped (`.github/workflows/test.yml`,
+   `.github/workflows/release.yml`); pending first run + minutes-budget
+   review on a public-repo runner
+4. PyPI listing for the Python wheel (workflow gated off until a
+   maintainer configures trusted publishing)
+5. `MAINTAINERS.md` with response SLA
 
 For the current honest scope ("what works today" vs "what does not work yet"),
 see [`STATUS.md`](STATUS.md).

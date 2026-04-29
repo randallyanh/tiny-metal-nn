@@ -15,6 +15,7 @@ In scope:
 - Performance work backed by `tests/benchmarks/tmnn_runtime_benchmarks.cpp` numbers
 - Documentation and reproducibility improvements
 - Additional flagship samples that follow the `samples/mlp_learning_an_image.cpp` pattern (≤ 400 LOC, runnable from a clean clone, mirrors a tcnn / instant-ngp-style workload where applicable)
+- Python binding work that follows the v1.0 design contract in [`docs/know-how/006-python-binding-design.md`](docs/know-how/006-python-binding-design.md) (single `tiny_metal_nn` namespace, fused `Trainer.training_step`) and the migration tooling deliverables (`tools/migrate_tcnn.py` CLI, `.claude/skills/tcnn-to-tmnn.md` skill, `examples/migrated/`)
 
 Out of scope:
 
@@ -22,7 +23,7 @@ Out of scope:
 - General-purpose tensor framework (use [MLX](https://github.com/ml-explore/mlx))
 - Generic GPU compute substrate — rasterization, CSG, meshing, image processing all belong to consumer libraries (e.g., [slangcsg](https://github.com/randallyanh/slangcsg))
 - CUDA backend (use [tiny-cuda-nn](https://github.com/NVlabs/tiny-cuda-nn) directly on NVIDIA)
-- Python bindings — tmnn is C++-only; tcnn compatibility is at the JSON-config layer, not the PyTorch-binding layer
+- A `tiny_metal_nn.compat.tcnn` shim namespace or `nn.Module` wrapping path — both rejected in `006-python-binding-design.md` v2 §1 / §5.1; tcnn compatibility is JSON-config layer (today) plus the migration tooling three-piece set (v1.0)
 - Medical-domain or FDA-regulated code — lives in private downstream repositories
 
 If you are unsure whether something fits, open an issue with the proposal before writing code.

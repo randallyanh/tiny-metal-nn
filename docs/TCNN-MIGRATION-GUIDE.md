@@ -11,17 +11,18 @@
 This guide is for users who already understand the `tiny-cuda-nn` mental model
 and want the shortest path to a working `tiny-metal-nn` port on Apple Metal.
 
-It focuses on the migration surfaces that exist **today**:
+The guide has two halves:
 
-- typed builders in `tiny-metal-nn/factory.h`
-- `tiny-cuda-nn`-style JSON canonicalization in `tiny-metal-nn/factory_json.h`
-- planner / manifest / prewarm APIs in
+- **§§ 2–9 — C++ migration**, the surfaces that exist today: typed builders in
+  `tiny-metal-nn/factory.h`, `tiny-cuda-nn`-style JSON canonicalization in
+  `tiny-metal-nn/factory_json.h`, planner / manifest / prewarm APIs in
   `tiny-metal-nn/network_with_input_encoding.h` (returns `NetworkPlan`),
-  `tiny-metal-nn/metal_context.h`, and
-  `tiny-metal-nn/autotune_manifest.h`
-
-Python onboarding is on the roadmap but not yet implemented; see
-[`STATUS.md`](../STATUS.md).
+  `tiny-metal-nn/metal_context.h`, and `tiny-metal-nn/autotune_manifest.h`.
+- **§ 10 — Python migration**, the planned v1.0 deliverable: a three-piece
+  tooling story (CLI translator, Claude Code skill, CI-verified migration
+  examples) that converts tcnn Python code to tmnn Python code. The Python
+  binding itself is shipping in v1.0; the migration tooling lands alongside it.
+  Design contract: [`know-how/006-python-binding-design.md`](know-how/006-python-binding-design.md).
 
 ---
 
@@ -276,7 +277,117 @@ This guide is honest only if it also lists what remains open:
 - matched-hardware comparison against native `tiny-cuda-nn` is not published in
   this repo yet
 - the cross-device Apple validation matrix is still active work
-- Python onboarding is on the roadmap but not yet implemented
+- Python migration tooling (§ 10) is in design contract; implementation lands
+  with the v1.0 Python binding
 
 Those are not reasons to block the first C++ port. They are reasons to keep the
 scope of the first port explicit.
+
+---
+
+## 10. Python migration (planned for v1.0)
+
+> Status: design contract finalized 2026-04-28. Implementation is part of the
+> v1.0 Python binding milestone. See
+> [`know-how/006-python-binding-design.md`](know-how/006-python-binding-design.md)
+> for the full design and
+> [`know-how/005-tcnn-compatibility-strategy.md`](know-how/005-tcnn-compatibility-strategy.md)
+> for the strategic decision record.
+
+### 10.1 The architectural shift
+
+`tiny-cuda-nn` and `tiny-metal-nn` use different training-loop abstractions:
+
+```python
+# tcnn pattern: model.forward + user-owned loss + user-owned optimizer
+output = model(input)                         # tcnn.NetworkWithInputEncoding(...)
+loss   = ((output - target) ** 2).mean()      # PyTorch
+loss.backward()                               # PyTorch autograd
+optimizer.step()                              # PyTorch optim.Adam
+optimizer.zero_grad()
+```
+
+```python
+# tmnn pattern: trainer.training_step (forward + backward + optimizer fused)
+loss = trainer.training_step(input, target)
+```
+
+This is the central, non-mechanical part of the migration: tmnn's fused
+`training_step` runs forward, backward, and the Adam step in a single Metal
+command buffer, which is where the Apple-side speedup comes from. Migrating
+into tmnn means moving the loss + optimizer choice into `Trainer.from_config`
+rather than the user's training loop.
+
+### 10.2 Three migration paths
+
+| Path | When to use | Status |
+|------|-------------|--------|
+| **CLI**: `tools/migrate_tcnn.py` | Mechanical translation of single files / directories. Best for code that uses standard tcnn idioms. | v1.0 deliverable |
+| **Claude Code skill**: `.claude/skills/tcnn-to-tmnn.md` | AI-assisted migration that handles edge cases the CLI cannot (custom losses, non-trivial encoding configs, project-wide refactors). Reads the same translation rules as the CLI. | v1.0 deliverable |
+| **Manual** | Reading this guide + the field-level mapping table in `know-how/006-python-binding-design.md` § 10. Useful when you want to understand each rule. | Always |
+
+All three paths share one source of truth: `tools/migrate_rules.py`. The CLI
+and skill consume it directly; the manual path is its README-level summary.
+
+### 10.3 Workflow (planned)
+
+```bash
+# 1. Inspect what would change, no files written
+$ tmnn-migrate train.py --check --diff
+
+# 2. Apply the migration
+$ tmnn-migrate train.py --output train_tmnn.py
+
+# 3. Run the migrated code
+$ python train_tmnn.py
+```
+
+Exit codes:
+
+- `0` — every translation rule was applied; the migrated file is ready
+- `1` — some segments need human review (custom loss, fp16, custom encoding,
+  multi-GPU). Diagnostics list each unhandled segment with file:line and
+  guidance
+- `2` — input could not be parsed
+
+### 10.4 Quick reference — the mappings most likely to apply
+
+For the complete mapping see
+[`know-how/006-python-binding-design.md`](know-how/006-python-binding-design.md)
+§ 10. The condensed view:
+
+| tcnn | tmnn | Notes |
+|------|------|-------|
+| `import tinycudann as tcnn` | `import tiny_metal_nn as tmnn` | mechanical |
+| `tcnn.NetworkWithInputEncoding(n_in, n_out, enc, net).to('cuda')` | `tmnn.Trainer.from_config({"n_input": n_in, "n_output": n_out, "encoding": enc, "network": net, "loss": ..., "optimizer": ...})` | loss + optimizer move into config; `'cuda'` → `'mps'` (or omit) |
+| `output = model(input); loss = ((output-target)**2).mean(); loss.backward(); optimizer.step()` | `loss = trainer.training_step(input, target)` | fused |
+| Encoding `otype: HashGrid` and standard fields (`n_levels`, `n_features_per_level`, `log2_hashmap_size`, `base_resolution`, `per_level_scale`, `interpolation: Linear`) | identical | direct copy |
+| Network `otype: FullyFusedMLP`, `n_neurons`, `n_hidden_layers`, `activation: ReLU` | identical | direct copy |
+| `otype: CutlassMLP` | `otype: FullyFusedMLP` | auto-mapped; CutlassMLP has no Metal equivalent |
+| `output_activation: None` | `output_activation: Linear` | alias normalized |
+| Optimizer `otype: Adam` with `learning_rate`, `beta1`, `beta2`, `epsilon`, `l2_reg` | identical | direct copy |
+| Loss `otype: L2`, `L1`, `Huber` (and `RelativeL2`, `SmoothL1`) | identical | direct copy |
+
+### 10.5 What the migration tool will warn about (human review needed)
+
+| Pattern | Reason |
+|---------|--------|
+| fp16 / `torch.cuda.amp` / `loss_scale` | tmnn v1.0 is fp32-only; fp16 is a v1.x+ roadmap item |
+| Multi-GPU / DDP | Apple Silicon is single-GPU; the migration tool removes the multi-GPU init code and warns |
+| Custom loss expressions (anything beyond MSE / L1 / Huber) | The fused `training_step` only supports built-in losses. The tool suggests either: (A) substitute the closest built-in, or (B) drop to the non-fused `trainer.forward(...) + manual backward` path |
+| Custom encodings (`otype` not in tmnn's list, e.g. `SphericalHarmonics`, `Frequency`, `OneBlob`) | No automatic equivalent; the tool suggests workarounds (use `MlpInit::Uniform` with explicit bound, or keep the encoding in PyTorch and feed the encoded features into tmnn) |
+| `.to('cuda')` / `'cuda:0'` | Rewritten to `.to('mps')` or removed; warned because performance / numerics may differ from the original CUDA report |
+
+### 10.6 What's intentionally **not** in scope for v1.0
+
+- `tiny_metal_nn.nn.NetworkWithInputEncoding(torch.nn.Module)` — the
+  `nn.Module` wrapping path. The migration tool replaces this need; if a
+  concrete user case shows it cannot, the path becomes a v1.x+ candidate. See
+  `know-how/006-python-binding-design.md` v2 § 5.1 and § 12.
+- A `tiny_metal_nn.compat.tcnn` shim namespace that lets `import tinycudann`
+  keep working. The strategic record (`know-how/005-tcnn-compatibility-strategy.md`
+  v2 Layer C) explains why this was rejected in favour of the migration tool.
+- Zero-copy MPS interop (`torch.Tensor` on MPS handed straight into the tmnn
+  forward kernel without a CPU bounce). The Q3 spike (2026-04-28) confirmed it
+  is feasible and stable across PyTorch ≥ 2.1; it ships in v1.x+, not v1.0.
+  v1.0 inputs go through a CPU staging copy.

@@ -19,7 +19,7 @@ It is intentionally **narrower** than a full cross-project bake-off:
 - it compares the systems on the product/runtime axes this repo explicitly
   claims
 - it cites only benchmark evidence that this repo has actually published
-- it now includes a first same-machine `MLX` baseline slice on Apple M1 Pro
+- it does not include a reproducible same-machine `MLX` baseline yet
 - it does **not** pretend that the repo has published a kernel-equivalent,
   matched-hardware `tiny-cuda-nn` row on Apple hardware
 
