@@ -869,7 +869,15 @@ struct DefaultRuntime final : ITrainerRuntime, InspectableTrainerRuntime {
   }
 
   ~DefaultRuntime() override {
-    drain_pending_if_needed();
+    // Drain pending command buffers before MTLBuffers are released by member
+    // destruction. Swallow any drain exception (e.g., out-of-range lane from
+    // a corrupted prior step): destructors must not throw, and a prior fatal
+    // would have surfaced via last_diagnostic already.
+    // See docs/know-how/007-python-binding-safety-engineering.md §2.1.
+    try {
+      drain_pending_if_needed();
+    } catch (...) {
+    }
   }
 
   TrainingStepResult training_step(const float *input, const float *target,

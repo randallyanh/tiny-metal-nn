@@ -217,6 +217,11 @@ else()
     option(TMNN_BUILD_TESTS "Build tiny-metal-nn smoke tests" OFF)
 endif()
 
+# v1.0 Python binding. OFF by default for plain cmake builds; turned ON by
+# scikit-build-core when invoked through `pip install`. See
+# docs/know-how/006-python-binding-design.md v2 §11 stage 4.
+option(TMNN_BUILD_PYTHON_MODULE "Build the tiny_metal_nn._C pybind11 module" OFF)
+
 if(TMNN_BUILD_SAMPLES)
     add_subdirectory(samples)
 endif()
@@ -224,4 +229,24 @@ endif()
 if(TMNN_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
+endif()
+
+if(TMNN_BUILD_PYTHON_MODULE)
+    find_package(pybind11 CONFIG REQUIRED)
+    pybind11_add_module(_C MODULE
+        src/python/tmnn_pybind.cpp
+    )
+    target_link_libraries(_C PRIVATE
+        tiny_metal_nn::tiny_metal_nn_core
+        tiny_metal_nn::tiny_metal_nn_runtime
+        tiny_metal_nn::tiny_metal_nn_extensions
+    )
+    set_target_properties(_C PROPERTIES
+        OUTPUT_NAME "_C"
+    )
+    # When invoked by scikit-build-core, install the .so into the wheel
+    # at tiny_metal_nn/_C.<abi>.so. For plain cmake dev builds the .so
+    # lives under build/_C.<abi>.so and the developer adds it to PYTHONPATH
+    # via the tiny_metal_nn/__init__.py shim or scikit-build-core editable.
+    install(TARGETS _C LIBRARY DESTINATION tiny_metal_nn)
 endif()

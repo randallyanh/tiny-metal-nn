@@ -498,6 +498,151 @@ inline TrainerConfig trainer_config_from_loss_config(
   return out;
 }
 
+// ── weight_init section (011 §6, ratified 2026-04-28) ────────────────────
+// JSON-parseable WeightInitConfig. Default-constructed when "weight_init" is
+// absent from the top-level config; per-field defaults match weight_init.h.
+
+// Trusting parsers: assume the canonical string was already validated by the
+// canonicalize pass, so these never push diagnostics.
+
+inline HashGridInit hash_grid_init_from_string(const std::string &s) {
+  if (s == "Zero")
+    return HashGridInit::Zero;
+  return HashGridInit::Uniform;
+}
+
+inline MlpInit mlp_init_from_string(const std::string &s) {
+  if (s == "KaimingNormal")
+    return MlpInit::KaimingNormal;
+  if (s == "XavierUniform")
+    return MlpInit::XavierUniform;
+  if (s == "XavierNormal")
+    return MlpInit::XavierNormal;
+  if (s == "Uniform")
+    return MlpInit::Uniform;
+  if (s == "Normal")
+    return MlpInit::Normal;
+  if (s == "Zero")
+    return MlpInit::Zero;
+  return MlpInit::KaimingUniform;
+}
+
+inline MlpNonlinearity mlp_nonlinearity_from_string(const std::string &s) {
+  if (s == "Linear")
+    return MlpNonlinearity::Linear;
+  if (s == "LeakyReLU")
+    return MlpNonlinearity::LeakyReLU;
+  if (s == "Tanh")
+    return MlpNonlinearity::Tanh;
+  if (s == "Sigmoid")
+    return MlpNonlinearity::Sigmoid;
+  return MlpNonlinearity::ReLU;
+}
+
+inline json canonicalize_weight_init_config(
+    const json &config, std::vector<ConfigDiagnostic> &diagnostics) {
+  validate_object(config, "weight_init", diagnostics);
+  validate_known_keys(config,
+                      {"hash_grid_init", "hash_grid_range", "mlp_init",
+                       "mlp_nonlinearity", "mlp_uniform_range",
+                       "mlp_normal_stddev", "mlp_kaiming_a", "seed"},
+                      "weight_init", diagnostics);
+
+  const std::string hash_grid_init = json_get<std::string>(
+      config, "hash_grid_init", "Uniform", "weight_init.hash_grid_init",
+      diagnostics);
+  if (hash_grid_init != "Uniform" && hash_grid_init != "Zero") {
+    push_diagnostic(
+        diagnostics, DiagnosticSeverity::Error, "weight_init.hash_grid_init",
+        "unsupported value '" + hash_grid_init +
+            "'; allowed: Uniform, Zero");
+  }
+
+  const float hash_grid_range = json_get<float>(
+      config, "hash_grid_range", 1.0e-4f, "weight_init.hash_grid_range",
+      diagnostics);
+  validate_positive_float(hash_grid_range, "weight_init.hash_grid_range",
+                          diagnostics);
+
+  const std::string mlp_init = json_get<std::string>(
+      config, "mlp_init", "KaimingUniform", "weight_init.mlp_init",
+      diagnostics);
+  if (mlp_init != "KaimingUniform" && mlp_init != "KaimingNormal" &&
+      mlp_init != "XavierUniform" && mlp_init != "XavierNormal" &&
+      mlp_init != "Uniform" && mlp_init != "Normal" && mlp_init != "Zero") {
+    push_diagnostic(
+        diagnostics, DiagnosticSeverity::Error, "weight_init.mlp_init",
+        "unsupported value '" + mlp_init +
+            "'; allowed: KaimingUniform, KaimingNormal, XavierUniform, "
+            "XavierNormal, Uniform, Normal, Zero");
+  }
+
+  const std::string mlp_nonlinearity = json_get<std::string>(
+      config, "mlp_nonlinearity", "ReLU", "weight_init.mlp_nonlinearity",
+      diagnostics);
+  if (mlp_nonlinearity != "Linear" && mlp_nonlinearity != "ReLU" &&
+      mlp_nonlinearity != "LeakyReLU" && mlp_nonlinearity != "Tanh" &&
+      mlp_nonlinearity != "Sigmoid") {
+    push_diagnostic(diagnostics, DiagnosticSeverity::Error,
+                    "weight_init.mlp_nonlinearity",
+                    "unsupported value '" + mlp_nonlinearity +
+                        "'; allowed: Linear, ReLU, LeakyReLU, Tanh, Sigmoid");
+  }
+
+  const float mlp_uniform_range = json_get<float>(
+      config, "mlp_uniform_range", 1.0e-2f, "weight_init.mlp_uniform_range",
+      diagnostics);
+  validate_positive_float(mlp_uniform_range, "weight_init.mlp_uniform_range",
+                          diagnostics);
+
+  const float mlp_normal_stddev = json_get<float>(
+      config, "mlp_normal_stddev", 1.0e-2f, "weight_init.mlp_normal_stddev",
+      diagnostics);
+  validate_positive_float(mlp_normal_stddev, "weight_init.mlp_normal_stddev",
+                          diagnostics);
+
+  const float mlp_kaiming_a = json_get<float>(
+      config, "mlp_kaiming_a", 0.0f, "weight_init.mlp_kaiming_a", diagnostics);
+  if (mlp_kaiming_a < 0.0f) {
+    push_diagnostic(diagnostics, DiagnosticSeverity::Error,
+                    "weight_init.mlp_kaiming_a", "must be >= 0");
+  }
+
+  const uint64_t seed = json_get<uint64_t>(config, "seed", 42u,
+                                            "weight_init.seed", diagnostics);
+
+  return {
+      {"hash_grid_init", hash_grid_init},
+      {"hash_grid_range", hash_grid_range},
+      {"mlp_init", mlp_init},
+      {"mlp_nonlinearity", mlp_nonlinearity},
+      {"mlp_uniform_range", mlp_uniform_range},
+      {"mlp_normal_stddev", mlp_normal_stddev},
+      {"mlp_kaiming_a", mlp_kaiming_a},
+      {"seed", seed},
+  };
+}
+
+inline TrainerConfig trainer_config_from_weight_init_config(
+    const json &config, const TrainerConfig &base = {}) {
+  TrainerConfig out = base;
+  WeightInitConfig &wi = out.weight_init;
+  wi.hash_grid_mode = hash_grid_init_from_string(
+      config.value("hash_grid_init", std::string("Uniform")));
+  wi.hash_grid_range = config.value("hash_grid_range", wi.hash_grid_range);
+  wi.mlp_mode = mlp_init_from_string(
+      config.value("mlp_init", std::string("KaimingUniform")));
+  wi.mlp_nonlinearity = mlp_nonlinearity_from_string(
+      config.value("mlp_nonlinearity", std::string("ReLU")));
+  wi.mlp_uniform_range =
+      config.value("mlp_uniform_range", wi.mlp_uniform_range);
+  wi.mlp_normal_stddev =
+      config.value("mlp_normal_stddev", wi.mlp_normal_stddev);
+  wi.mlp_kaiming_a = config.value("mlp_kaiming_a", wi.mlp_kaiming_a);
+  wi.seed = config.value("seed", wi.seed);
+  return out;
+}
+
 } // namespace detail
 
 } // namespace tmnn

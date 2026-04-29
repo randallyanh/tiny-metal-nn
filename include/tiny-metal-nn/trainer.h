@@ -228,6 +228,27 @@ public:
       : model_(std::move(model)), loss_(std::move(loss)),
         optimizer_(std::move(optimizer)), runtime_(std::move(runtime)) {}
 
+  // Drain pending GPU work before letting members release their MTLBuffers.
+  // The runtime impl's own dtor also drains, but doing it here ensures the
+  // contract holds even for ITrainerRuntime impls that omit drain-on-destroy
+  // (mocks, future runtimes). Swallowing exceptions: dtors must not throw,
+  // and any sync failure here means a prior step's diagnostic is already on
+  // record. See docs/know-how/007-python-binding-safety-engineering.md §2.1.
+  ~Trainer() noexcept {
+    if (runtime_) {
+      try {
+        runtime_->sync_weights();
+      } catch (...) {
+      }
+    }
+  }
+
+  // The unique_ptr member already deletes copy ops; the explicit dtor above
+  // would otherwise also suppress the implicit move ops, so default them.
+  Trainer(const Trainer &) = delete;
+  Trainer &operator=(const Trainer &) = delete;
+  Trainer(Trainer &&) noexcept = default;
+  Trainer &operator=(Trainer &&) noexcept = default;
 
   // ── Training (fused path) ───────────────────────────────────
 

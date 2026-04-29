@@ -3653,3 +3653,59 @@ TEST(DefaultTrainer, GP4DGS_Output3_EvaluatorReturns3D) {
   for (int i = 0; i < 3; ++i)
     EXPECT_TRUE(std::isfinite(output[i])) << "output[" << i << "] not finite";
 }
+
+// ── dtor / sync protocol stress tests (Stage 2; see 006 v2 §11, 007 §2.1) ──
+//
+// These tests validate that ~Trainer() drains pending GPU command buffers
+// before any MTLBuffer is released. Reaching the end of each test without
+// crash, hang, or use-after-free implies the dtor sync chain works.
+
+static_assert(std::is_nothrow_destructible_v<Trainer>,
+              "Trainer dtor must be noexcept (007 §2.1: dtors must not throw)");
+
+TEST(DefaultTrainer, DtorAfterTrainingStepDoesNotCrash) {
+  auto ctx = MetalContext::create();
+  if (!ctx->is_gpu_available()) GTEST_SKIP() << "No GPU";
+
+  const int N = default_trainer_config().batch_size;
+  std::vector<float> pos, tgt;
+  make_sphere_batch(N, 3, pos, tgt);
+  {
+    auto trainer = create_trainer({}, small_net(), {}, ctx);
+    auto result = trainer.training_step(pos.data(), tgt.data(), N);
+    EXPECT_TRUE(std::isfinite(result.loss));
+  }  // ← dtor here
+  SUCCEED();
+}
+
+TEST(DefaultTrainer, RepeatedCreateAndDestroyIsClean) {
+  auto ctx = MetalContext::create();
+  if (!ctx->is_gpu_available()) GTEST_SKIP() << "No GPU";
+
+  // 16 cycles. A leak in dtor sync would surface as: GPU buffer
+  // accumulation, hang on commit, or use-after-free crash.
+  std::vector<float> pos, tgt;
+  make_sphere_batch(64, 3, pos, tgt);
+  for (int i = 0; i < 16; ++i) {
+    auto trainer = create_trainer({}, small_net(), {.batch_size = 64}, ctx);
+    auto result = trainer.training_step(pos.data(), tgt.data(), 64);
+    EXPECT_TRUE(std::isfinite(result.loss)) << "iteration " << i;
+  }
+}
+
+TEST(DefaultTrainer, DtorAfterManyConsecutiveStepsCompletes) {
+  auto ctx = MetalContext::create();
+  if (!ctx->is_gpu_available()) GTEST_SKIP() << "No GPU";
+
+  const int N = default_trainer_config().batch_size;
+  std::vector<float> pos, tgt;
+  make_sphere_batch(N, 3, pos, tgt);
+  {
+    auto trainer = create_trainer({}, small_net(), {}, ctx);
+    for (int i = 0; i < 32; ++i) {
+      auto result = trainer.training_step(pos.data(), tgt.data(), N);
+      EXPECT_TRUE(std::isfinite(result.loss)) << "step " << i;
+    }
+  }  // ← dtor must drain whatever the final step queued
+  SUCCEED();
+}

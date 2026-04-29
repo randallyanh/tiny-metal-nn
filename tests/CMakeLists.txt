@@ -35,6 +35,7 @@ add_executable(tmnn_unit_tests
     unit/tmnn/test_training_step_lifecycle.cpp
     unit/tmnn/test_kernel_generation.cpp
     unit/tmnn/test_default_trainer.cpp
+    unit/tmnn/test_documentation_claims.cpp
 )
 target_link_libraries(tmnn_unit_tests PRIVATE
     tiny_metal_nn::tiny_metal_nn_runtime
@@ -43,6 +44,9 @@ target_link_libraries(tmnn_unit_tests PRIVATE
     GTest::gtest
 )
 target_compile_features(tmnn_unit_tests PRIVATE cxx_std_23)
+target_compile_definitions(tmnn_unit_tests PRIVATE
+    TMNN_REPO_ROOT="${CMAKE_SOURCE_DIR}"
+)
 
 # Default per-test timeout. Sanitizer-instrumented binaries run 2–5× slower,
 # so allow more wall-clock under TMNN_ENABLE_SANITIZERS to keep the slowest

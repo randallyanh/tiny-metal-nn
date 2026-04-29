@@ -1,6 +1,9 @@
 set(_TMNN_SLOW_TESTS
   DefaultTrainer.StressRepeatedCreateDestroy
   DefaultTrainer.StressCheckpointAfterManySteps
+  # Stage-2 dtor sync stress tests (16 / 32 cycles; cold-start dominates).
+  DefaultTrainer.RepeatedCreateAndDestroyIsClean
+  DefaultTrainer.DtorAfterManyConsecutiveStepsCompletes
   DefaultTrainer.OracleTrainingConvergesToKnownFunction
   DefaultTrainer.OracleOptimizerBlobPreservesTrainingContinuity
   DefaultTrainer.OracleGradientMatchesFiniteDifference

@@ -275,7 +275,8 @@ TEST_F(MetalHeapTest, BeginTransientFrameMicrobench) {
               static_cast<double>(ns) / kIter, kIter);
 }
 
-// G5b: transient hot-path microbench — sub-100ns target.
+// G5b: transient hot-path microbench. Printed as a release-reference metric;
+// not asserted here because sub-100 ns thresholds are scheduler/load sensitive.
 TEST_F(MetalHeapTest, TransientAllocateMicrobench) {
   HeapConfig cfg;
   cfg.persistent_shared_capacity_bytes  = 1024 * 1024;
