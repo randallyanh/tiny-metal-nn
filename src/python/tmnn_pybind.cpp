@@ -256,7 +256,7 @@ PYBIND11_MODULE(_C, m) {
       "tiny_metal_nn native binding.\n"
       "Public surface lives at tiny_metal_nn.*; this module is internal.\n"
       "See docs/know-how/006-python-binding-design.md v2 for the design contract.";
-  m.attr("__version__") = "0.1.0a1";
+  m.attr("__version__") = "0.1.0a2";
 
   // ── Typed exception hierarchy (006 v2 §7.4) ──────────────────────────
   // Each bound to its dedicated C++ subclass so pybind11's own value_error /

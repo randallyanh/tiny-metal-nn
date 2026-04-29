@@ -18,7 +18,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "tiny-metal-nn"
-version = "0.1.0a1"
+version = "0.1.0a2"
 description = "Apple Metal native runtime for hash-grid + MLP neural-field training (Python binding ships in v1.0)."
 readme = "README.md"
 license = { file = "LICENSE" }
