@@ -1,0 +1,46 @@
+{
+  "_doc": "Reference metrics for the sphere_sdf example. CI uses thresholds.* as perf-regression gates. Update this file when intentional changes shift a number; do NOT raise a threshold to make a failing test pass — find the regression first.",
+  "_role": "smoke test / regression anchor (not a discovery tool); see docs/know-how/013-network-driven-development.md for layer definitions",
+
+  "captured_at": "2026-04-29",
+  "tmnn_version": "0.1.0a2",
+  "machine": "M1 Pro / 32 GB / macOS 15",
+  "config_summary": "HashGrid n_levels=4 features_per_level=2 log2_hashmap=14, FullyFusedMLP n_neurons=16 hidden_layers=1, batch=4096, 50 steps, torch.manual_seed(42)",
+
+  "params": {
+    "encoding": 131072,
+    "network": 161,
+    "total_fp32": 131233
+  },
+
+  "convergence": {
+    "step_0":  0.130579,
+    "step_10": 0.023629,
+    "step_20": 0.007029,
+    "step_30": 0.003719,
+    "step_40": 0.001589,
+    "step_49": 0.001447
+  },
+
+  "timing_ms": {
+    "trainer_construct":   96.3,
+    "step_0_cold":          7.95,
+    "step_warm_median":     1.40,
+    "step_warm_mean":       1.47,
+    "step_warm_min":        1.30,
+    "step_warm_max":        2.39,
+    "_note":                "step 0 cold includes kernel-cache lookup; first step in fresh process can be 100-600 ms when no cache exists"
+  },
+
+  "memory_mb": {
+    "host_rss_delta":  188,
+    "_note":           "majority is PyTorch (~150 MB) + Python interpreter; tmnn proper estimated < 40 MB"
+  },
+
+  "thresholds": {
+    "_doc":                       "CI perf-regression gates. ~3-5x headroom over observed values to absorb variance without masking real regressions.",
+    "final_loss_max":             0.01,
+    "step_warm_median_max_ms":    5.0,
+    "host_rss_delta_max_mb":      350
+  }
+}

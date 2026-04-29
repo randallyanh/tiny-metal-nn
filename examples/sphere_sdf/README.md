@@ -86,34 +86,82 @@ convergence claim on a CUDA box. Apple Silicon users can ignore it.
 python examples/sphere_sdf/tcnn/train.py
 ```
 
-## Cross-implementation comparison (status)
+## Reference metrics
 
-The 006 v2 §4.3 contract calls for CI to run *both* implementations on
-the same dataset and assert their final losses agree within 5×.
+[`reference_metrics.json`](reference_metrics.json) records the numbers
+this sample produces on a known machine (M1 Pro, 32 GB, macOS 15) and
+the perf-regression gates CI uses. Excerpt:
 
-In practice the tcnn side requires CUDA hardware that Apple Silicon CI
-does not have. Until a separate CUDA CI lane is wired up, the
-verification is split:
+| Metric | Value | CI gate |
+|---|---|---|
+| step 49 loss | 0.001447 | `< 0.01` |
+| step warm median time | 1.40 ms | `< 5 ms` |
+| host RSS delta | 188 MB | `< 350 MB` |
+| trainer construct | 96 ms | (informational) |
+| total params (fp32) | 131,233 | (informational) |
 
-- **CI (Apple Silicon)** — runs the tmnn version, asserts
-  `final_loss < 0.01` after 50 steps. Anything above that is treated
-  as a P0 regression.
-- **Manual / external** — anyone with a CUDA machine can run the tcnn
-  version and visually compare the loss curve to the published values
-  above. We do not block merges on this comparison today.
+Update [`reference_metrics.json`](reference_metrics.json) when an
+intentional change shifts a number; do **not** raise a threshold to
+make a failing test pass — find the regression first.
 
-The 5×-of-tcnn assertion lands in CI when a CUDA-capable runner is
-available (006 v2 §11 stage 11 polish).
+## Discoveries log (what this sample taught us about tmnn)
+
+This sample lives in the **smoke-test tier** of the network-experiment
+doctrine — it confirms the v1.0 binding pipeline is wired correctly and
+serves as a stable regression anchor. It is **not** a discovery tool.
+Larger samples in the planned set (`bunny_sdf/`, `dragon_sdf/`,
+`nerf_lego/`, `neus_surface/`) put more pressure on tmnn's hot paths and
+are where genuine capability / performance / functional gaps surface.
+
+What `sphere_sdf` validated, end-to-end:
+
+- the v1.0 Python binding wires correctly: `Trainer.from_config` →
+  numpy / torch CPU tensor input → fused `training_step` → `inference`
+  → `close` / `__exit__`
+- the libcst-based migration CLI (`tools/migrate_tcnn.py`) produces code
+  that trains correctly after the documented manual-finish step (drop
+  `device = torch.device("cuda")`, drop `.to(device)`, change
+  `loss.item()` → `loss`)
+- the convergence guard contract (`final_loss < threshold`) is a stable
+  CI pattern across tmnn versions
+
+What `sphere_sdf` did **not** drive:
+
+The tmnn improvements that involve sphere-SDF data — P5 init's 460×
+convergence speedup, GPU Philox cold-start drop from ~240 ms to
+sub-millisecond — were discovered via the dedicated
+`--init-convergence-ablation` benchmark in
+`tests/benchmarks/tmnn_runtime_benchmarks.cpp`, not via this sample.
+sphere_sdf provided the input function for that ablation, not the
+diagnostic instrument.
+
+For tmnn diagnostic value, run the larger samples once they ship.
+
+## Cross-implementation comparison (intentionally not done)
+
+The original v1.0 plan called for CI to run both implementations on the
+same dataset and assert their final losses agree within 5×. This is no
+longer the plan: matched-hardware vs-tcnn benchmarks were dropped from
+the roadmap (see internal doctrine for the rationale — the short
+version is "different hardware tiers make any cross comparison noisy
+enough that the marketing value is below the maintenance cost").
+
+The `tcnn/train.py` file is preserved verbatim as documentation of
+"the migration's `before`" — it is not run by CI. Apple Silicon users
+can ignore it. CUDA-capable readers who want to run it for personal
+verification:
+
+```
+python examples/sphere_sdf/tcnn/train.py
+```
 
 ## Why this example specifically
 
 - **Small enough for CI** — 50 steps, batch 4096, finishes in ~2 seconds
   on M1 Pro.
-- **Real, not toy** — sphere SDF is the textbook hash-grid + MLP
-  workload; matches what Nerfstudio / instant-NGP fork code does in
-  miniature.
-- **Exercises every stage of the binding** — Trainer.from_config,
-  training_step (numpy + torch interop, stage 7), the fused loss path,
-  and final loss assertion via the binding's float return.
-
-If a contributor breaks any of those layers, this example fails first.
+- **Exercises every layer of the binding** — `Trainer.from_config`,
+  `training_step` (numpy + torch interop), the fused loss path, the
+  inference path, the close / context manager lifecycle.
+- **Stable regression anchor** — if a contributor breaks any of those
+  layers, this example fails first via the CI thresholds in
+  [`reference_metrics.json`](reference_metrics.json).
