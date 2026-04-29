@@ -1,0 +1,87 @@
+# Continuous integration: run the C++ + Python test suites on every push
+# and PR. Apple Silicon-only because tmnn requires a Metal device; the
+# `macos-14` runner label points at GitHub-hosted M1 hardware (free for
+# public repositories, see https://docs.github.com/billing — current as
+# of 2026-04).
+#
+# Slow / convergence / oracle tests are excluded here (they run separately
+# in `nightly.yml` if added later). Tests labeled `slow;deep` in
+# `tests/LabelSlowTests.cmake` are filtered by `ctest -LE slow`.
+
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel an in-flight CI run when a newer commit lands on the same PR.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python ${{ matrix.python-version }} (Apple Silicon)
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Bootstrap vcpkg
+        run: |
+          git clone --depth=1 https://github.com/microsoft/vcpkg.git "$HOME/vcpkg"
+          "$HOME/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+          echo "VCPKG_ROOT=$HOME/vcpkg" >> "$GITHUB_ENV"
+
+      - name: Install build deps (no isolation so vcpkg is visible)
+        run: pip install scikit-build-core pybind11
+
+      - name: Build + install tmnn (editable)
+        run: pip install -e ".[dev]" --no-build-isolation
+
+      - name: Run Python tests
+        run: pytest tests/python/ -v
+
+  cpp:
+    name: C++ tests (Apple Silicon, fast tier)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bootstrap vcpkg
+        run: |
+          git clone --depth=1 https://github.com/microsoft/vcpkg.git "$HOME/vcpkg"
+          "$HOME/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+          echo "VCPKG_ROOT=$HOME/vcpkg" >> "$GITHUB_ENV"
+
+      - name: Configure
+        run: cmake -S . -B build -DTMNN_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build -j
+
+      # `slow;deep` tests run separately on a longer cadence; the fast
+      # tier here keeps PR turnaround under ~10 minutes.
+      #
+      # GitHub-hosted macOS runners don't expose a Metal GPU device to
+      # the runner process (the macOS VM is virtualized). A handful of
+      # tests assume a real GPU and don't yet self-skip; we exclude
+      # them here. The PackageSmokeTest_* group does its own downstream
+      # CMake configure that needs vcpkg paths the runner doesn't have.
+      # MicrobenchReferencesAreNotClaimedAsCtestGates references a
+      # gitignored know-how baseline file that's absent on a fresh clone.
+      #
+      # All four groups run cleanly on Apple Silicon dev machines.
+      - name: Run fast tests
+        run: |
+          ctest --test-dir build --output-on-failure -LE slow \
+            -E '^(TmnnCore\.EvaluateFailureExposesStructuredDiagnostic|RuntimeSkeleton\.DeviceCapabilitiesDefaults|DocumentationClaims\.MicrobenchReferencesAreNotClaimedAsCtestGates|TinyMetalNNPackageSmokeTest_)'

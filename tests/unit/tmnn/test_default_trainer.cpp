@@ -1011,7 +1011,7 @@ TEST(DefaultTrainer, SetInitialWeightsRoundTrips) {
   }
 }
 
-// Phase 5.3 integration smoke: wire KaimingNormal through
+// Phase 5.3 integration smoke: wire MlpInit::KaimingNormal through
 // TrainerConfig.weight_init end-to-end and verify the trainer
 // constructs + evaluates + trains without producing NaN/Inf. The
 // Box-Muller kernel itself is pinned by
@@ -1038,7 +1038,7 @@ TEST(DefaultTrainer, KaimingNormalInitProducesFiniteOutputs) {
                     positions, targets);
 
   // Pre-step evaluate must produce finite outputs (Box-Muller +
-  // Kaiming stddev should give bounded weight magnitudes).
+  // fan-in-scaled stddev should give bounded weight magnitudes).
   std::vector<float> out_pre(trainer.batch_plan().max_batch_size);
   ASSERT_TRUE(trainer.evaluate(positions.data(), out_pre.data(),
                                trainer.batch_plan().max_batch_size));
@@ -1351,10 +1351,12 @@ TEST(DefaultTrainer, SplitPathMatchesFusedPath) {
   // may realize SIMD. After fixing exact Adam tail-count handling, the
   // previously rounded-away last parameter now updates too, so the
   // stable parity envelope is slightly wider than the old 1e-3 bound.
-  // P5 calibration: bumped from 2e-3 to 1.5e-2 because Kaiming-init
-  // forward outputs are ~10× larger than legacy uniform-init outputs,
-  // so the SIMD-vs-scalar floating-point reordering delta scales
-  // proportionally. Algorithmic equivalence preserved.
+  // P5 calibration: bumped from 2e-3 to 1.5e-2 because the new
+  // fan-in-scaled init produces forward outputs ~22× larger than the
+  // legacy uniform-init outputs (measured by
+  // --init-convergence-ablation), so the SIMD-vs-scalar floating-point
+  // reordering delta scales proportionally. Algorithmic equivalence
+  // preserved.
   EXPECT_LT(max_diff, 1.5e-2f)
       << "Split and fused paths diverged: max_diff=" << max_diff;
 }
@@ -2805,11 +2807,12 @@ TEST(DefaultTrainer, AccumGradientLinearityFourCalls) {
   // Atomic float accumulation may introduce small rounding differences.
   // 5e-3 absolute tolerance (not bitwise — atomics are non-deterministic
   // order). P5 calibration: tolerance bumped from 1e-4 to 5e-3 because
-  // Kaiming init produces ~10× larger forward-output magnitudes than the
-  // legacy uniform[-0.01, 0.01] init, so float-rounding noise scales
+  // the fan-in-scaled MLP init produces ~22× larger forward-output
+  // magnitudes than the legacy uniform[-0.01, 0.01] init (measured by
+  // --init-convergence-ablation: pre-step mean|abs| 0.21 vs 0.0094 on
+  // default config), so float-rounding noise in the accumulation scales
   // accordingly. The algorithmic property (4× accum == 1× scaled-up) is
-  // unchanged; only the absolute float-precision threshold needed
-  // recalibration.
+  // unchanged; only the absolute precision threshold recalibrated.
   EXPECT_LT(max_diff, 5e-3f)
       << "4× accum vs 1× (4× gradient) max diff=" << max_diff;
 }
@@ -2868,11 +2871,12 @@ TEST(DefaultTrainer, AccumZeroGradientsPreventsLeakage) {
   // With zero gradient at step 2, Adam still updates weights via the
   // bias-corrected momentum from step 1 (m_2 = beta1 * m_1; non-zero).
   // The output diff scales with the magnitude of m_1, which scales with
-  // step-1 gradient magnitude, which scales with Kaiming-init forward
-  // output magnitude. P5 calibration: tolerance bumped from 1e-3 to 1e-1
-  // for the new init scale. The test still pins what it cares about —
-  // momentum-only updates are bounded — just at the larger absolute
-  // scale Kaiming-initialized networks produce.
+  // step-1 gradient magnitude, which scales with forward-output
+  // magnitude. P5 calibration: tolerance bumped from 1e-3 to 1e-1 to
+  // accommodate the new ~22× larger forward outputs of the fan-in-scaled
+  // init (measured 0.21 vs legacy 0.0094 mean|abs|). The test still
+  // pins what it cares about — momentum-only updates are bounded — just
+  // at the larger absolute scale.
   EXPECT_LT(max_change, 1e-1f)
       << "Zero-gradient step should produce a momentum-only update, "
          "max_change=" << max_change;
@@ -3501,10 +3505,11 @@ TEST(DefaultTrainer, GP4DGS_Output3_TrainedFieldMatchesTarget) {
   err_x /= N; err_y /= N; err_z /= N;
 
   // Trained field should approximate the target within 50% of target
-  // magnitude. P5 calibration: err_z bumped 0.01 → 0.02 because Kaiming
-  // init has different convergence dynamics than the legacy uniform
-  // init at 50 training steps. Z is the smallest target component
-  // (0.02 max magnitude), so its envelope is most sensitive.
+  // magnitude. P5 calibration: err_z bumped 0.01 → 0.02 because the
+  // new fan-in-scaled init has different early-step convergence
+  // dynamics than the legacy uniform init at 50 training steps. Z is
+  // the smallest target component (0.02 max magnitude), so its
+  // envelope is most sensitive.
   EXPECT_LT(err_x, 0.05f) << "X displacement error too large: " << err_x;
   EXPECT_LT(err_y, 0.025f) << "Y displacement error too large: " << err_y;
   EXPECT_LT(err_z, 0.02f) << "Z displacement error too large: " << err_z;
@@ -3647,4 +3652,60 @@ TEST(DefaultTrainer, GP4DGS_Output3_EvaluatorReturns3D) {
   ASSERT_TRUE(evaluator->evaluate(pos, output, 1));
   for (int i = 0; i < 3; ++i)
     EXPECT_TRUE(std::isfinite(output[i])) << "output[" << i << "] not finite";
+}
+
+// ── dtor / sync protocol stress tests (Stage 2; see 006 v2 §11, 007 §2.1) ──
+//
+// These tests validate that ~Trainer() drains pending GPU command buffers
+// before any MTLBuffer is released. Reaching the end of each test without
+// crash, hang, or use-after-free implies the dtor sync chain works.
+
+static_assert(std::is_nothrow_destructible_v<Trainer>,
+              "Trainer dtor must be noexcept (007 §2.1: dtors must not throw)");
+
+TEST(DefaultTrainer, DtorAfterTrainingStepDoesNotCrash) {
+  auto ctx = MetalContext::create();
+  if (!ctx->is_gpu_available()) GTEST_SKIP() << "No GPU";
+
+  const int N = default_trainer_config().batch_size;
+  std::vector<float> pos, tgt;
+  make_sphere_batch(N, 3, pos, tgt);
+  {
+    auto trainer = create_trainer({}, small_net(), {}, ctx);
+    auto result = trainer.training_step(pos.data(), tgt.data(), N);
+    EXPECT_TRUE(std::isfinite(result.loss));
+  }  // ← dtor here
+  SUCCEED();
+}
+
+TEST(DefaultTrainer, RepeatedCreateAndDestroyIsClean) {
+  auto ctx = MetalContext::create();
+  if (!ctx->is_gpu_available()) GTEST_SKIP() << "No GPU";
+
+  // 16 cycles. A leak in dtor sync would surface as: GPU buffer
+  // accumulation, hang on commit, or use-after-free crash.
+  std::vector<float> pos, tgt;
+  make_sphere_batch(64, 3, pos, tgt);
+  for (int i = 0; i < 16; ++i) {
+    auto trainer = create_trainer({}, small_net(), {.batch_size = 64}, ctx);
+    auto result = trainer.training_step(pos.data(), tgt.data(), 64);
+    EXPECT_TRUE(std::isfinite(result.loss)) << "iteration " << i;
+  }
+}
+
+TEST(DefaultTrainer, DtorAfterManyConsecutiveStepsCompletes) {
+  auto ctx = MetalContext::create();
+  if (!ctx->is_gpu_available()) GTEST_SKIP() << "No GPU";
+
+  const int N = default_trainer_config().batch_size;
+  std::vector<float> pos, tgt;
+  make_sphere_batch(N, 3, pos, tgt);
+  {
+    auto trainer = create_trainer({}, small_net(), {}, ctx);
+    for (int i = 0; i < 32; ++i) {
+      auto result = trainer.training_step(pos.data(), tgt.data(), N);
+      EXPECT_TRUE(std::isfinite(result.loss)) << "step " << i;
+    }
+  }  // ← dtor must drain whatever the final step queued
+  SUCCEED();
 }

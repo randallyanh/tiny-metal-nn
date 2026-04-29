@@ -13,9 +13,11 @@
 // must be called from a single thread, or be externally serialized by the
 // caller. Concurrent allocate from multiple threads will corrupt the live
 // counters, the staging free lists, and the label cache. The hot transient
-// path is sub-100 ns precisely because it does no atomic / lock work; a
-// caller that needs cross-thread allocation should either run a Heap per
-// thread or wrap calls in its own mutex. Apple's MTLDevice / MTLHeap
+// path stays extremely small precisely because it does no atomic / lock
+// work; clean release microbenchmarks can reach sub-100 ns, but shared
+// machines can exceed that. A caller that needs cross-thread allocation
+// should either run a Heap per thread or wrap calls in its own mutex.
+// Apple's MTLDevice / MTLHeap
 // themselves are thread-safe; only this wrapper is not.
 
 #include <cstddef>

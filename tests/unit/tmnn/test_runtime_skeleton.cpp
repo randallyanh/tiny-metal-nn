@@ -390,6 +390,54 @@ TEST(RuntimeSkeleton, InitUniformPhiloxKernelProducesUniform) {
   EXPECT_TRUE(any_diff);
 }
 
+// Phase 5.5: cross-build / cross-process reproducibility pin. The
+// Philox kernel is deterministic at the algorithm level (counter-based,
+// no shared state), and the uint32 → float conversion is bit-exact on
+// IEEE-754 hardware, so the same seed must produce the same first N
+// outputs across rebuilds. This test captures a frozen snapshot of the
+// first 8 floats produced by Uniform(seed=42, low=-0.5, high=0.5,
+// counter_base=0) on a 1024-float buffer and asserts byte-equality.
+// Failure here means either the kernel changed semantically or the
+// host's float-conversion semantics drifted — both are red flags worth
+// surfacing immediately.
+TEST(RuntimeSkeleton, InitUniformPhiloxSeedFortyTwoGoldenSnapshot) {
+  auto ctx = MetalContext::create();
+  if (!ctx->is_gpu_available())
+    GTEST_SKIP() << "No GPU";
+  auto &arena = detail::context_arena(*ctx);
+
+  constexpr size_t kN = 1024;
+  auto h = arena.allocate({kN * sizeof(float), 256, BufferStorage::Shared,
+                           BufferLifetime::Persistent, "init_golden"});
+  auto v = arena.view(h);
+
+  detail::context_dispatch_init_uniform(*ctx, v, kN,
+                                        /*low=*/-0.5f, /*high=*/0.5f,
+                                        /*seed=*/42u,
+                                        /*counter_base=*/0u);
+
+  // Captured 2026-04-28 on Apple M1 Pro / macOS 24.6.0 with the P5.5
+  // build of init_uniform_philox. Update this snapshot intentionally
+  // when you change the Philox round constants, the uniform-conversion
+  // formula, or the per-thread output layout — never silently.
+  static const float kGolden[8] = {
+       0.1129598618f,
+      -0.0314134955f,
+      -0.4267682731f,
+      -0.1591384411f,
+       0.4877186418f,
+      -0.1729366183f,
+       0.0139061213f,
+      -0.0456843972f,
+  };
+  const auto *out = static_cast<const float *>(v.data);
+  for (size_t i = 0; i < 8; ++i) {
+    ASSERT_EQ(out[i], kGolden[i])
+        << "Reproducibility regression at i=" << i
+        << " — Philox / uint32→float pipeline drifted";
+  }
+}
+
 // Phase 5.3: Box-Muller normal-distribution kernel correctness.
 //   * Sample mean ≈ requested mean
 //   * Sample stddev ≈ requested stddev

@@ -3,9 +3,9 @@
 `tiny-metal-nn` is the Metal-native tmnn core for hash-grid + MLP neural-field
 training and inference on Apple GPUs.
 
-`tmnn` is pre-1.0. The default standalone train/eval path is supported and is
-what this quickstart walks through. Broader SDK ergonomics (Python bindings,
-additional flagship samples, cross-device benchmark validation) are still on
+`tmnn` is pre-1.0. The default standalone C++ train/eval path is supported, and
+an optional Python binding ships alongside it. Both are walked through below.
+Cross-device benchmark validation and additional flagship samples are still on
 the roadmap — see [`STATUS.md`](../STATUS.md) for the current honest scope.
 
 ## Build
@@ -83,6 +83,60 @@ To inspect the realized runtime specialization on a successful run:
 ```bash
 TMNN_SAMPLE_PRINT_RUNTIME_INSPECTION=1 ./build/samples/mlp_learning_an_image
 ```
+
+## Python binding (optional)
+
+The Python package wraps `Trainer` via pybind11. Install via the build
+backend (scikit-build-core invokes the same CMake project):
+
+```bash
+python3.13 -m venv .venv
+.venv/bin/pip install scikit-build-core pybind11
+VCPKG_ROOT=$VCPKG_ROOT .venv/bin/pip install -e ".[dev]" --no-build-isolation
+```
+
+Headline workflow on the Python side:
+
+```python
+import tiny_metal_nn as tmnn
+import numpy as np
+
+config = {
+    "encoding": {"otype": "HashGrid", "n_levels": 4, "log2_hashmap_size": 14},
+    "network":  {"otype": "FullyFusedMLP", "n_neurons": 16, "n_hidden_layers": 1},
+    "batch_size": 4096,
+}
+with tmnn.Trainer.from_config(config, n_input=3, n_output=1) as trainer:
+    pos = np.random.randn(4096, 3).astype(np.float32)
+    target = (np.linalg.norm(pos, axis=1, keepdims=True) - 0.5).astype(np.float32)
+    for step in range(50):
+        loss = trainer.training_step(pos, target)
+    output = trainer.inference(pos)
+```
+
+Torch CPU tensors (`float32`, contiguous) are accepted directly by
+`training_step` / `inference` via the numpy `__array__` protocol; non-CPU
+tensors (MPS / CUDA) are rejected with an explicit `.cpu()` hint.
+
+The full Python surface and design notes are in
+[`ARCHITECTURE.md`](ARCHITECTURE.md) § 6.
+
+## Migrating from tinycudann (Python)
+
+If you have an existing `tinycudann`-based training script, the migration
+tooling can do the mechanical conversion (imports + the canonical 5-line
+training-loop body) and flag the rest:
+
+```bash
+.venv/bin/python tools/migrate_tcnn.py path/to/train.py --diff       # preview
+.venv/bin/python tools/migrate_tcnn.py path/to/train.py --output train_tmnn.py
+```
+
+A worked example pair (the original tcnn version + the migrated tmnn
+version + a CI convergence check) lives at
+`examples/sphere_sdf/`. See
+[`docs/TCNN-MIGRATION-GUIDE.md`](TCNN-MIGRATION-GUIDE.md) § 10 for the
+field-by-field schema diff and the manual-edit catalog.
 
 ## Notes on current boundaries
 

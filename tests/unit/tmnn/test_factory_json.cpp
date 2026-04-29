@@ -276,3 +276,206 @@ TEST(FactoryJson, TryCreateFromConfigSucceedsWithoutDiagnostic) {
   auto trainer = std::move(*result);
   EXPECT_TRUE(trainer.is_gpu_available());
 }
+
+// ── weight_init section (011 §6, ratified 2026-04-28) ────────────────────
+
+TEST(FactoryJson, WeightInitDefaultsCanonicalize) {
+  std::vector<ConfigDiagnostic> diagnostics;
+  json canonical =
+      detail::canonicalize_weight_init_config(json::object(), diagnostics);
+
+  EXPECT_TRUE(diagnostics.empty());
+  EXPECT_EQ(canonical.at("hash_grid_init"), "Uniform");
+  EXPECT_FLOAT_EQ(canonical.at("hash_grid_range").get<float>(), 1.0e-4f);
+  EXPECT_EQ(canonical.at("mlp_init"), "KaimingUniform");
+  EXPECT_EQ(canonical.at("mlp_nonlinearity"), "ReLU");
+  EXPECT_FLOAT_EQ(canonical.at("mlp_uniform_range").get<float>(), 1.0e-2f);
+  EXPECT_FLOAT_EQ(canonical.at("mlp_normal_stddev").get<float>(), 1.0e-2f);
+  EXPECT_FLOAT_EQ(canonical.at("mlp_kaiming_a").get<float>(), 0.0f);
+  EXPECT_EQ(canonical.at("seed").get<uint64_t>(), 42u);
+}
+
+TEST(FactoryJson, WeightInitAllMlpInitValuesAccepted) {
+  for (const std::string &v :
+       {"KaimingUniform", "KaimingNormal", "XavierUniform", "XavierNormal",
+        "Uniform", "Normal", "Zero"}) {
+    std::vector<ConfigDiagnostic> diagnostics;
+    json canonical = detail::canonicalize_weight_init_config(
+        json{{"mlp_init", v}}, diagnostics);
+    EXPECT_TRUE(diagnostics.empty()) << "rejected '" << v << "'";
+    EXPECT_EQ(canonical.at("mlp_init"), v);
+  }
+}
+
+TEST(FactoryJson, WeightInitAllNonlinearityValuesAccepted) {
+  for (const std::string &v :
+       {"Linear", "ReLU", "LeakyReLU", "Tanh", "Sigmoid"}) {
+    std::vector<ConfigDiagnostic> diagnostics;
+    json canonical = detail::canonicalize_weight_init_config(
+        json{{"mlp_nonlinearity", v}}, diagnostics);
+    EXPECT_TRUE(diagnostics.empty()) << "rejected '" << v << "'";
+    EXPECT_EQ(canonical.at("mlp_nonlinearity"), v);
+  }
+}
+
+TEST(FactoryJson, WeightInitRejectsInvalidEnumValueWithSuggestion) {
+  std::vector<ConfigDiagnostic> diagnostics;
+  detail::canonicalize_weight_init_config(json{{"mlp_init", "Bogus"}},
+                                          diagnostics);
+  bool found = false;
+  for (const auto &d : diagnostics) {
+    if (d.path == "weight_init.mlp_init" &&
+        d.severity == DiagnosticSeverity::Error) {
+      EXPECT_NE(d.message.find("Bogus"), std::string::npos);
+      EXPECT_NE(d.message.find("KaimingUniform"), std::string::npos);
+      found = true;
+    }
+  }
+  EXPECT_TRUE(found) << "expected error diagnostic on weight_init.mlp_init";
+}
+
+TEST(FactoryJson, WeightInitRejectsNegativeRange) {
+  std::vector<ConfigDiagnostic> diagnostics;
+  detail::canonicalize_weight_init_config(
+      json{{"mlp_uniform_range", -0.01f}}, diagnostics);
+  bool found = false;
+  for (const auto &d : diagnostics) {
+    if (d.path == "weight_init.mlp_uniform_range" &&
+        d.severity == DiagnosticSeverity::Error) {
+      found = true;
+    }
+  }
+  EXPECT_TRUE(found);
+}
+
+TEST(FactoryJson, WeightInitRejectsUnknownKey) {
+  std::vector<ConfigDiagnostic> diagnostics;
+  detail::canonicalize_weight_init_config(
+      json{{"mystery_field", 1.0f}}, diagnostics);
+  bool found = false;
+  for (const auto &d : diagnostics) {
+    if (d.path == "weight_init.mystery_field" &&
+        d.severity == DiagnosticSeverity::Error) {
+      found = true;
+    }
+  }
+  EXPECT_TRUE(found);
+}
+
+TEST(FactoryJson, TrainerConfigFromWeightInitPlumbsValues) {
+  json canonical = {
+      {"hash_grid_init", "Zero"},
+      {"hash_grid_range", 5.0e-5f},
+      {"mlp_init", "KaimingNormal"},
+      {"mlp_nonlinearity", "LeakyReLU"},
+      {"mlp_uniform_range", 2.0e-2f},
+      {"mlp_normal_stddev", 3.0e-2f},
+      {"mlp_kaiming_a", 0.1f},
+      {"seed", uint64_t{12345}},
+  };
+  TrainerConfig out =
+      detail::trainer_config_from_weight_init_config(canonical, {});
+
+  EXPECT_EQ(out.weight_init.hash_grid_mode, HashGridInit::Zero);
+  EXPECT_FLOAT_EQ(out.weight_init.hash_grid_range, 5.0e-5f);
+  EXPECT_EQ(out.weight_init.mlp_mode, MlpInit::KaimingNormal);
+  EXPECT_EQ(out.weight_init.mlp_nonlinearity, MlpNonlinearity::LeakyReLU);
+  EXPECT_FLOAT_EQ(out.weight_init.mlp_uniform_range, 2.0e-2f);
+  EXPECT_FLOAT_EQ(out.weight_init.mlp_normal_stddev, 3.0e-2f);
+  EXPECT_FLOAT_EQ(out.weight_init.mlp_kaiming_a, 0.1f);
+  EXPECT_EQ(out.weight_init.seed, uint64_t{12345});
+}
+
+// ── batch_size top-level (011 §1, ratified 2026-04-28) ───────────────────
+
+TEST(FactoryJson, BatchSizeTopLevelAccepted) {
+  auto ctx = MetalContext::create();
+  if (!ctx->is_gpu_available())
+    GTEST_SKIP() << "No GPU";
+
+  json config = {
+      {"encoding",
+       {{"otype", "HashGrid"}, {"n_levels", 8}, {"log2_hashmap_size", 17}}},
+      {"network", {{"otype", "FullyFusedMLP"}, {"n_neurons", 32}}},
+      {"batch_size", 512},
+  };
+
+  auto result =
+      try_create_from_config(3, 1, config, default_trainer_config(), ctx);
+  ASSERT_TRUE(result.has_value());
+  auto trainer = std::move(*result);
+  EXPECT_EQ(trainer.batch_plan().max_batch_size, 512u);
+}
+
+TEST(FactoryJson, BatchSizeRejectsZero) {
+  json config = {
+      {"encoding", {{"otype", "HashGrid"}}},
+      {"network", {{"otype", "FullyFusedMLP"}}},
+      {"batch_size", 0},
+  };
+
+  auto result = try_create_from_config(3, 1, config);
+  EXPECT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code, DiagnosticCode::InvalidArgument);
+  EXPECT_NE(result.error().message.find("batch_size"), std::string::npos);
+}
+
+// ── reference example from 011 §9 — full default JSON canonicalizes ──────
+
+TEST(FactoryJson, ReferenceExampleCanonicalizesCleanly) {
+  // Mirrors docs/know-how/011-json-schema-frozen.md §9: the full default
+  // config with every key explicit. Drift between this test and 011 §9 is
+  // a P0 doc/code mismatch.
+  json config = {
+      {"encoding",
+       {{"otype", "HashGrid"},
+        {"n_levels", 16},
+        {"n_features_per_level", 2},
+        {"log2_hashmap_size", 19},
+        {"base_resolution", 16.0f},
+        {"per_level_scale", 1.447f},
+        {"interpolation", "Linear"}}},
+      {"network",
+       {{"otype", "FullyFusedMLP"},
+        {"n_neurons", 64},
+        {"n_hidden_layers", 2},
+        {"activation", "ReLU"},
+        {"output_activation", "None"}}},
+      {"loss", {{"otype", "L2"}}},
+      {"optimizer",
+       {{"otype", "Adam"},
+        {"learning_rate", 1e-3f},
+        {"beta1", 0.9f},
+        {"beta2", 0.99f},
+        {"epsilon", 1e-15f},
+        {"l1_reg", 0.0f},
+        {"l2_reg", 0.0f}}},
+      {"weight_init",
+       {{"hash_grid_init", "Uniform"},
+        {"hash_grid_range", 1.0e-4f},
+        {"mlp_init", "KaimingUniform"},
+        {"mlp_nonlinearity", "ReLU"},
+        {"mlp_uniform_range", 1.0e-2f},
+        {"mlp_normal_stddev", 1.0e-2f},
+        {"mlp_kaiming_a", 0.0f},
+        {"seed", uint64_t{42}}}},
+      {"batch_size", 1024},
+  };
+
+  auto canonical_model = canonicalize_model_config(3, 1, config);
+  EXPECT_FALSE(canonical_model.has_errors());
+
+  std::vector<ConfigDiagnostic> diagnostics;
+  detail::canonicalize_loss_config(config.at("loss"), diagnostics);
+  detail::canonicalize_optimizer_config(config.at("optimizer"), diagnostics);
+  detail::canonicalize_weight_init_config(config.at("weight_init"),
+                                          diagnostics);
+  bool any_error = false;
+  for (const auto &d : diagnostics) {
+    if (d.severity == DiagnosticSeverity::Error) {
+      ADD_FAILURE() << "unexpected error: " << d.path << ": " << d.message;
+      any_error = true;
+    }
+  }
+  EXPECT_FALSE(any_error);
+}

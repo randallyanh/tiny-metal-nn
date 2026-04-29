@@ -297,8 +297,9 @@ try_create_from_config(uint32_t n_input_dims, uint32_t n_output_dims,
   }
 
   std::vector<ConfigDiagnostic> diagnostics;
-  detail::validate_known_keys(config, {"encoding", "network", "loss",
-                                       "optimizer", "training"},
+  detail::validate_known_keys(config,
+                              {"encoding", "network", "loss", "optimizer",
+                               "weight_init", "batch_size", "training"},
                               "config", diagnostics);
 
   const auto canonical_model =
@@ -313,6 +314,21 @@ try_create_from_config(uint32_t n_input_dims, uint32_t n_output_dims,
       config.contains("optimizer") ? config.at("optimizer")
                                    : json{{"otype", "Adam"}},
       diagnostics);
+  const auto canonical_weight_init = detail::canonicalize_weight_init_config(
+      config.contains("weight_init") ? config.at("weight_init")
+                                     : json::object(),
+      diagnostics);
+
+  // Top-level batch_size (011 §1, ratified 2026-04-28). Optional; uses
+  // trainer_cfg.batch_size as fallback when absent.
+  int batch_size_value = trainer_cfg.batch_size;
+  const bool has_batch_size = config.contains("batch_size");
+  if (has_batch_size) {
+    batch_size_value =
+        detail::json_get<int>(config, "batch_size", trainer_cfg.batch_size,
+                              "batch_size", diagnostics);
+    detail::validate_positive_int(batch_size_value, "batch_size", diagnostics);
+  }
 
   if (auto diagnostic =
           detail::diagnostic_from_config_errors("create_from_config",
@@ -327,10 +343,15 @@ try_create_from_config(uint32_t n_input_dims, uint32_t n_output_dims,
         detail::build_network_from_canonical(canonical_model.network));
     auto loss = detail::build_loss_from_canonical(canonical_loss);
     auto optimizer = detail::build_optimizer_from_canonical(canonical_optimizer);
-    auto resolved_train_cfg = detail::trainer_config_from_loss_config(
-        canonical_loss,
-        detail::trainer_config_from_optimizer_config(canonical_optimizer,
-                                                     trainer_cfg));
+    auto resolved_train_cfg = detail::trainer_config_from_weight_init_config(
+        canonical_weight_init,
+        detail::trainer_config_from_loss_config(
+            canonical_loss,
+            detail::trainer_config_from_optimizer_config(canonical_optimizer,
+                                                         trainer_cfg)));
+    if (has_batch_size) {
+      resolved_train_cfg.batch_size = batch_size_value;
+    }
     return try_create_trainer(std::move(model), std::move(loss),
                               std::move(optimizer), resolved_train_cfg,
                               std::move(ctx));

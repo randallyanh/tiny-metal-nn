@@ -828,6 +828,109 @@ void run_reset_optimizer_microbench() {
               kIter, med, mn / 1.0e6, mx / 1.0e6);
 }
 
+// Phase 5.5 ablation: side-by-side training of two trainers with
+// different WeightInitConfig defaults — legacy uniform[-0.01, 0.01]
+// (the pre-P5 baseline) vs current P5 default (per-layer fan-in-scaled
+// uniform on the MLP, uniform[-1e-4, 1e-4] on the hash grid). Same
+// data, same seed for
+// the data ordering, separate seeds for each trainer's init so the
+// only varying factor is the init scheme. Reports loss after step 1
+// and step 50 — useful for sanity-checking that the new defaults
+// don't regress convergence on tmnn's actual workload.
+void run_init_convergence_ablation() {
+  auto ctx = MetalContext::create();
+  if (!ctx->is_gpu_available()) {
+    std::printf("tmnn init-convergence-ablation: skipped (no GPU)\n");
+    return;
+  }
+
+  HashGridEncoding::Config enc_cfg;  // log2_hashmap=19 default
+  FullyFusedMLP::Config net_cfg;
+  net_cfg.hidden_dim = 32;
+  net_cfg.n_input    = enc_cfg.num_levels * enc_cfg.features_per_level;
+
+  TrainerConfig tcfg_p5{.batch_size = 1024};
+  tcfg_p5.weight_init.seed = 42u;
+  // P5 defaults: KaimingUniform mode (fan-in-scaled) / hash 1e-4.
+
+  TrainerConfig tcfg_legacy{.batch_size = 1024};
+  tcfg_legacy.weight_init.seed = 42u;
+  tcfg_legacy.weight_init.hash_grid_mode  = HashGridInit::Uniform;
+  tcfg_legacy.weight_init.hash_grid_range = 1.0e-2f;
+  tcfg_legacy.weight_init.mlp_mode        = MlpInit::Uniform;
+  tcfg_legacy.weight_init.mlp_uniform_range = 1.0e-2f;
+
+  auto trainer_p5     = create_trainer(enc_cfg, net_cfg, tcfg_p5,     ctx);
+  auto trainer_legacy = create_trainer(enc_cfg, net_cfg, tcfg_legacy, ctx);
+
+  const auto plan = trainer_p5.batch_plan();
+  const int N = static_cast<int>(plan.max_batch_size);
+
+  // Same dataset for both trainers — sphere SDF.
+  std::mt19937 rng(7);
+  std::uniform_real_distribution<float> du(-1.0f, 1.0f);
+  std::vector<float> positions(static_cast<size_t>(N) * plan.input_dims);
+  std::vector<float> targets(static_cast<size_t>(N) * plan.target_dims);
+  for (int i = 0; i < N; ++i) {
+    const float x = du(rng), y = du(rng), z = du(rng);
+    positions[i * plan.input_dims + 0] = x;
+    positions[i * plan.input_dims + 1] = y;
+    positions[i * plan.input_dims + 2] = z;
+    targets[i] = std::sqrt(x * x + y * y + z * z) - 0.5f;
+  }
+
+  auto train_n_steps = [&](Trainer &t, int steps,
+                            std::vector<float> &losses) {
+    for (int s = 0; s < steps; ++s) {
+      auto r = t.training_step(positions.data(), targets.data(), N);
+      losses.push_back(static_cast<float>(r.loss));
+    }
+  };
+
+  // Pre-step forward output magnitudes — empirical justification for
+  // the test threshold bumps that came in with P5 (the
+  // AccumGradientLinearityFourCalls / AccumZeroGradientsPreventsLeakage /
+  // SplitPathMatchesFusedPath / GP4DGS_Output3 cases). Larger output
+  // magnitudes scale floating-point precision noise proportionally.
+  auto measure_pre_step_output = [&](Trainer &t) {
+    std::vector<float> out(static_cast<size_t>(N) * plan.target_dims);
+    t.evaluate(positions.data(), out.data(), N);
+    float mn = 0.0f, mx = 0.0f, sum_abs = 0.0f;
+    for (float v : out) {
+      mn = std::min(mn, v); mx = std::max(mx, v);
+      sum_abs += std::abs(v);
+    }
+    return std::tuple{mn, mx, sum_abs / out.size()};
+  };
+  auto [p5_min, p5_max, p5_mean] = measure_pre_step_output(trainer_p5);
+  auto [lg_min, lg_max, lg_mean] = measure_pre_step_output(trainer_legacy);
+  std::printf(
+      "  pre-step output magnitudes "
+      "(min, max, mean|abs|):\n"
+      "    P5     : (%.4f, %.4f, %.4f)\n"
+      "    legacy : (%.4f, %.4f, %.4f)\n"
+      "    P5/legacy mean|abs| ratio: %.2fx\n",
+      p5_min, p5_max, p5_mean,
+      lg_min, lg_max, lg_mean,
+      lg_mean > 0.0f ? p5_mean / lg_mean : 0.0f);
+
+  std::vector<float> p5_losses, legacy_losses;
+  p5_losses.reserve(50); legacy_losses.reserve(50);
+  train_n_steps(trainer_p5,     50, p5_losses);
+  train_n_steps(trainer_legacy, 50, legacy_losses);
+
+  std::printf(
+      "tmnn init-convergence-ablation [HashGrid log2_hashmap=19, "
+      "batch=%d, 50 steps]:\n", N);
+  std::printf("  step  P5(KaimingUniform+1e-4)   Legacy(Uniform 1e-2)\n");
+  for (int s : {0, 1, 4, 9, 19, 29, 39, 49}) {
+    std::printf("  %4d  %22.6f   %20.6f\n",
+                s + 1, p5_losses[s], legacy_losses[s]);
+  }
+  std::printf("  final P5/legacy ratio = %.3f (lower = P5 converged faster)\n",
+              p5_losses.back() / legacy_losses.back());
+}
+
 // Phase 5 microbench: time a single create_trainer call with the
 // default HashGridEncoding (log2_hashmap=19 ⇒ 16M-float hash grid =
 // 64 MiB Adam-state per copy). Pre-Phase-5 this paid ~240 ms of CPU
@@ -1154,6 +1257,7 @@ int main(int argc, char **argv) {
   bool reset_optimizer_microbench = false;
   bool checkpoint_microbench = false;
   bool init_microbench = false;
+  bool init_convergence_ablation = false;
   bool wired_memory_trace = false;
   bool allocate_microbench = false;
   for (int i = 1; i < argc; ++i) {
@@ -1178,6 +1282,8 @@ int main(int argc, char **argv) {
       checkpoint_microbench = true;
     else if (std::string_view(argv[i]) == "--init-microbench")
       init_microbench = true;
+    else if (std::string_view(argv[i]) == "--init-convergence-ablation")
+      init_convergence_ablation = true;
     else if (std::string_view(argv[i]) == "--wired-memory-trace")
       wired_memory_trace = true;
     else if (std::string_view(argv[i]) == "--allocate-microbench")
@@ -1208,6 +1314,10 @@ int main(int argc, char **argv) {
   }
   if (init_microbench) {
     run_init_microbench();
+    return 0;
+  }
+  if (init_convergence_ablation) {
+    run_init_convergence_ablation();
     return 0;
   }
   if (wired_memory_trace) {

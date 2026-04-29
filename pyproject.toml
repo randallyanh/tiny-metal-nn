@@ -1,0 +1,78 @@
+# tiny-metal-nn — Apple Metal native runtime for hash-grid + MLP neural-field
+# training and inference. Primary surface is C++; the Python binding (single
+# `tiny_metal_nn` namespace) plus the migration tooling three-piece set ship
+# in v1.0.
+#
+# Build backend: scikit-build-core. `pip install -e .` invokes CMake with
+# TMNN_BUILD_PYTHON_MODULE=ON, builds the pybind11 module, and places it at
+# tiny_metal_nn/_C.<abi>.so so `import tiny_metal_nn` finds it.
+#
+# Design contracts:
+#   - docs/know-how/006-python-binding-design.md  (v2; binding API + migration)
+#   - docs/know-how/007-python-binding-safety-engineering.md  (lifetime / GIL)
+#   - docs/know-how/011-json-schema-frozen.md     (v1.0 JSON config schema)
+
+[build-system]
+requires = ["scikit-build-core>=0.10", "pybind11>=2.13"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "tiny-metal-nn"
+version = "0.1.0.dev0"
+description = "Apple Metal native runtime for hash-grid + MLP neural-field training (Python binding ships in v1.0)."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [{ name = "tiny-metal-nn contributors" }]
+keywords = ["metal", "neural-field", "hash-grid", "apple-silicon", "tinycudann", "instant-ngp"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: MacOS",
+    "License :: OSI Approved :: Apache Software License",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "numpy>=1.26",
+    "torch>=2.4",
+    # libcst preserves comments / whitespace / blank lines through the
+    # migration tool's source rewrite — ast.unparse loses all of it.
+    "libcst>=1.4",
+]
+
+[tool.scikit-build]
+cmake.minimum-version = "3.20"
+cmake.build-type = "Release"
+wheel.packages = ["tiny_metal_nn"]
+# Editable installs auto-rebuild on import after C++ source edits, so the
+# dev workflow is `edit .cpp → import tiny_metal_nn` without manual cmake.
+# `build-dir` is required by editable.rebuild so scikit-build-core can
+# reuse a persistent CMake binary directory between rebuilds.
+build-dir = "build/{wheel_tag}"
+editable.mode = "redirect"
+editable.rebuild = true
+# Pass through TMNN_BUILD_PYTHON_MODULE so the CMake binding target activates
+# only when invoked through the Python build path. Tests + samples are off
+# in wheel builds (they're the C++ project's concern).
+[tool.scikit-build.cmake.define]
+TMNN_BUILD_PYTHON_MODULE = "ON"
+TMNN_BUILD_TESTS = "OFF"
+TMNN_BUILD_SAMPLES = "OFF"
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+markers = [
+    "torture: lifetime / GIL / leak / dtype safety tests (007 §6.1)",
+    "slow: tests that take more than 5 seconds; CI may schedule separately",
+]
+filterwarnings = ["error::DeprecationWarning"]
+addopts = "-ra --strict-markers --tb=short"

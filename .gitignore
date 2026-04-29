@@ -22,6 +22,12 @@ Testing/
 __pycache__/
 .pytest_cache/
 .hypothesis/
+.venv/
+*.egg-info/
+.ruff_cache/
+
+# Claude Code runtime state (skill / scheduled task locks etc.)
+.claude/scheduled_tasks.lock
 
 # Internal know-how — design records, decision logs, internal strategy.
 # Not for public distribution. Lives only in working tree.
