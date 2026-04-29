@@ -42,6 +42,33 @@ def test_sphere_sdf_tmnn_converges_below_threshold():
     a real regression (e.g., if Adam state were silently lost
     mid-training).
     """
+    # The example imports tiny_metal_nn at module load, so the GPU
+    # probe must run before that import. Mirror the conftest.py logic
+    # in-line because this file does not request the `tmnn` fixture.
+    import tiny_metal_nn as _tmnn  # noqa: PLC0415
+
+    try:
+        with _tmnn.Trainer.from_config(
+            {
+                "encoding": {
+                    "otype": "HashGrid",
+                    "n_levels": 2,
+                    "log2_hashmap_size": 10,
+                },
+                "network": {
+                    "otype": "FullyFusedMLP",
+                    "n_neurons": 16,
+                    "n_hidden_layers": 1,
+                },
+            },
+            n_input=3,
+            n_output=1,
+        ) as _probe:
+            if not _probe.is_gpu_available():
+                pytest.skip("no Metal GPU available (CI runner virtualization?)")
+    except Exception as exc:
+        pytest.skip(f"Trainer probe failed ({type(exc).__name__}: {exc})")
+
     import train  # noqa: PLC0415
 
     losses = train.run(verbose=False)

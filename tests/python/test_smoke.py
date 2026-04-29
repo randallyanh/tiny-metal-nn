@@ -13,12 +13,24 @@ import numpy as np
 import pytest
 
 
-def test_module_has_expected_surface(tmnn):
-    """The wheel exposes Trainer, ClosedError, __version__."""
+def test_module_has_expected_surface():
+    """The wheel exposes Trainer, ClosedError, __version__.
+
+    Imports `tiny_metal_nn` directly (no `tmnn` fixture) so this test
+    runs even on no-GPU CI runners — the public-surface check does not
+    need a Metal device.
+    """
+    import tiny_metal_nn as tmnn  # noqa: PLC0415
+
     assert hasattr(tmnn, "Trainer")
     assert hasattr(tmnn, "ClosedError")
+    assert hasattr(tmnn, "ConcurrentTrainingStepError")
+    assert hasattr(tmnn, "ConfigError")
+    assert hasattr(tmnn, "DTypeError")
     assert hasattr(tmnn, "__version__")
     assert issubclass(tmnn.ClosedError, Exception)
+    assert issubclass(tmnn.ConfigError, ValueError)
+    assert issubclass(tmnn.DTypeError, TypeError)
 
 
 def test_from_config_with_minimal_dict(tmnn, baseline_config):
